@@ -44,7 +44,7 @@ class TestKinds(unittest.TestCase):
         self.assertEqual(ma.infer_kind("memory", "", "任务: 修复登录 | 结果: 成功"), ma.KIND_TASK)
 
     def test_default_fact(self):
-        self.assertEqual(ma.infer_kind("services", "ngi", "容器 192.0.2.25"), ma.KIND_FACT)
+        self.assertEqual(ma.infer_kind("services", "demo-svc", "容器 192.0.2.25"), ma.KIND_FACT)
 
     def test_query_intent_preference(self):
         self.assertIn(ma.KIND_PREFERENCE, ma.query_kinds("用户喜欢什么回答风格"))
@@ -104,8 +104,8 @@ class TestScoring(unittest.TestCase):
 
     def test_dedupe_results(self):
         rows = [
-            {"content": "nginx upstream mf_backend -> 192.0.2.33:9081 配置错误"},
-            {"content": "nginx upstream mf_backend -> 192.0.2.33:9081 配置错误!!"},
+            {"content": "nginx upstream demo_backend -> 192.0.2.33:9081 配置错误"},
+            {"content": "nginx upstream demo_backend -> 192.0.2.33:9081 配置错误!!"},
             {"content": "完全不同的内容 docker compose 部署"},
         ]
         out = ma.dedupe_results(rows, threshold=0.85)
@@ -138,7 +138,7 @@ class TestConsolidation(unittest.TestCase):
     def test_merge_plan_keeps_rich_doc(self):
         rows = [
             entry("a", "短内容", "infrastructure", trust=1.0, hits=0),
-            entry("b", "更长的内容, 包含端口 192.0.2.18 和路径 /compose", "infrastructure",
+            entry("b", "更长的内容, 包含端口 192.0.2.18 和路径 /srv/demo", "infrastructure",
                   trust=0.8, hits=5),
         ]
         plan = ma.merge_plan([0, 1], rows)

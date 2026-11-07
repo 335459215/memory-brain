@@ -52,6 +52,10 @@ systemctl --user restart kb-http.service
 6. `_compact_memory_file` 过滤指针行，避免递归入库；
 7. zvec 单次写入上限 1024 条：全库更新用 `_batch_update` / `_batch_delete` 分片。
 
+## 数据边界
+
+本目录只包含代码、单元测试和文档，不包含任何 Hermes 知识库条目、聊天记录、用户名、账号、密码、Token 或真实服务配置；示例中的 IP 使用 RFC 5737 文档地址（192.0.2.0/24），服务名均为占位符。
+
 ## 测试
 
 ```bash
