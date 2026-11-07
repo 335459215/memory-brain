@@ -1,0 +1,7 @@
+# Hermes KB MCP server dependencies (the adapter itself only needs numpy)
+zvec>=0.7.0
+mcp>=1.0.0
+sentence-transformers>=2.2.0
+numpy>=1.24
+httpx>=0.24
+PyYAML>=6.0

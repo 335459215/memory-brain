@@ -17,6 +17,21 @@ Hermes 的 `kb_compact` 会把 MEMORY.md 压成「主题 → `kb搜'…'`」指�
 
 `is_pointer_doc()` 识别这类派生产物，`kb_health(fix=True)` / `kb_optimize()` 自动软废弃，搜索时直接过滤。
 
+## 目录内容
+
+```
+integrations/hermes/
+├── memory_adapt.py      # 适配核心：RRF / kind / 去重 / 体检 / 保守遗忘
+├── mcp_server.py        # 已适配的完整 Hermes KB MCP server（可直接替换）
+├── llm_helper.py        # 语义闸门/概览/精简共用的 LLM 配置读取
+├── requirements.txt     # server 依赖
+├── patches/mcp_server.patch
+├── tests/test_memory_adapt.py
+└── README.md
+```
+
+`mcp_server.py` 是 live 版本（2026-11-07，2181 行），包含 `kb_health` / `kb_dedup` / `kb_reindex` 和全部检索改造；如果只想最小改动，用 `patches/mcp_server.patch`。
+
 ## 安装到 Hermes KB
 
 ```bash
