@@ -24,7 +24,6 @@ Design rules borrowed from memory-brain:
 
 from __future__ import annotations
 
-import math
 import re
 import time
 from typing import Any, Iterable
@@ -89,8 +88,6 @@ def infer_kind(category: str = "", title: str = "", content: str = "",
     cat = str(category or "").strip().lower()
     title_l = str(title or "").strip().lower()
     head = str(content or "")[:200]
-    text = f"{title or ''}\n{head}"
-    low = text.lower()
     head_low = head.lower()
 
     if cat == "rules" or any(title_l.startswith(w) for w in ("铁律", "规则", "约定", "规范")):
