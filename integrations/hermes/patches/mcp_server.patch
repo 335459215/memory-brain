@@ -1,0 +1,795 @@
+--- /root/hermes-kb/mcp_server.py.bak-20261107_201548	2026-11-07 20:15:48.889510436 +0800
++++ /root/hermes-kb/mcp_server.py	2026-11-07 20:22:12.816511352 +0800
+@@ -28,6 +28,9 @@
+ from mcp.server.mcpserver import MCPServer
+ from sentence_transformers import SentenceTransformer
+ 
++# memory-brain 适配层 (RRF 混合检索 / 记忆类型 / 合并 / 体检 / 保守遗忘)
++import memory_adapt as ma
++
+ # Obsidian 兼容的 markdown 镜像目录 (kb_export 导出 / kb_add 同步)
+ NOTES_ROOT = Path(os.environ.get("KB_NOTES_ROOT", "/root/hermes-kb/notes"))
+ 
+@@ -138,6 +141,15 @@
+             zvec.FieldSchema(name="scene", data_type=zvec.DataType.INT32),
+             expression="0"
+         )
++
++    if "kind" not in field_names:
++        # 2026-11-07: 记忆类型 (memory-brain 五类记忆借鉴)。
++        # INT32 枚举: 0=未标注, 1=fact, 2=episode, 3=preference, 4=lesson, 5=rule, 6=profile, 7=task
++        print("[MCP-KB] Schema迁移: 添加 kind (INT32 记忆类型)...", file=sys.stderr, flush=True)
++        col.add_column(
++            zvec.FieldSchema(name="kind", data_type=zvec.DataType.INT32),
++            expression="0"
++        )
+     
+     # 验证迁移结果
+     schema = col.schema
+@@ -307,29 +319,33 @@
+         _metrics["total_ms"] += elapsed_ms
+ 
+ 
+-def _auto_deprecate(col) -> int:
+-    """自动废弃: 超过90天未更新的条目标记deprecated=1, 返回处理数"""
++def _auto_deprecate(col, stale_days: int = 365) -> int:
++    """保守遗忘 (memory-brain 衰减策略适配版)。
++
++    旧逻辑「90 天未更新就废弃」会杀掉稳定知识 (规则/基础设施/服务文档),
++    且每天后台跑一次, 三个月后整个 KB 被清空。现在只废弃:
++      1. kb_compact 产生的指针/导航文件 (派生垃圾, 还会递归繁殖);
++      2. 长期 (> stale_days) 低信任 (<0.5) 且从未被检索到的条目。
++    高信任、有命中、规则类知识永不因年龄淘汰。
++    """
++    docs = list(_iter_all_docs(col))
++    candidates = ma.select_forgetting(docs, stale_days=stale_days, min_trust=0.5)
++    if not candidates:
++        return 0
+     now = int(time.time())
+-    threshold_ts = now - 90 * 86400  # 90天前
+-    all_docs = col.query(zvec.Query("embedding", vector=[0.0]*384), topk=10000)
++    by_reason = {}
+     batch = []
+-    for r in all_docs:
+-        dep = r.fields.get("deprecated", 0)
+-        if isinstance(dep, str): dep = int(dep) if dep.isdigit() else 0
+-        if dep >= 1:
+-            continue  # 已废弃，跳过
+-        updated_at = r.fields.get("updated_at", 0)
+-        if isinstance(updated_at, str):
+-            try: updated_at = int(updated_at)
+-            except: updated_at = 0
+-        if updated_at > 0 and updated_at < threshold_ts:
+-            batch.append(zvec.Doc(id=r.id, fields={"deprecated": 1, "trust_score": 0.0, "updated_at": now}))
+-    if batch:
+-        col.update(batch)
++    for c in candidates:
++        by_reason[c["reason"]] = by_reason.get(c["reason"], 0) + 1
++        batch.append(zvec.Doc(id=c["id"], fields={
++            "deprecated": 1, "trust_score": 0.0, "updated_at": now
++        }))
++    _batch_update(col, batch)
++    print(f"[MCP-KB] 保守遗忘: {by_reason} (stale_days={stale_days})", file=sys.stderr, flush=True)
+     return len(batch)
+ 
+ 
+-def _cleanup_deprecated(col, days: int = 180) -> int:
++def _cleanup_deprecated(col, days: int = 730) -> int:
+     """物理删除: 已废弃超过N天的条目, 返回删除数"""
+     now = int(time.time())
+     threshold_ts = now - days * 86400
+@@ -347,7 +363,7 @@
+         if updated_at > 0 and updated_at < threshold_ts:
+             to_delete.append(r.id)
+     if to_delete:
+-        col.delete(to_delete)
++        _batch_delete(col, to_delete)
+     return len(to_delete)
+ 
+ 
+@@ -397,6 +413,9 @@
+         content,
+         "",
+     ]
++    kind = ma.kind_name(f.get("kind", 0))
++    if kind:
++        md.insert(6, f"kind: {kind}")
+     scene = _read_scene_field(f)
+     if scene:
+         md.insert(6, f"scene: {scene}")
+@@ -436,122 +455,131 @@
+ 
+ @mcp.tool()
+ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float = 0.0,
+-              scene: str = "", level: str = "L2") -> dict:
+-    """搜索Hermes知识库。mode: hybrid(默认,向量+FTS融合)/vector(语义)/fts(全文)。min_trust: 最低信任分阈值(默认0.0不过滤; 已废弃条目一律不返回, 查看用 kb_trust list_deprecated)。
+-    scene: 场景过滤 chat/working/coding(默认""不过滤)。同场景条目复合分+0.15优先; 未打标条目兜底保留(标scene_fallback=true); 已打标但场景不符的跳过。
+-    level: 加载层级 L2=全文(默认,向后兼容) / L0=首句摘要+content_len+truncated标记(省token, 借鉴OpenViking分层加载, 长结果建议用L0)"""
++              scene: str = "", level: str = "L2", explain: bool = False,
++              dedupe: bool = True, include_pointer: bool = False) -> dict:
++    """搜索Hermes知识库。mode: hybrid(默认,向量+FTS RRF融合)/vector(语义)/fts(全文)。min_trust: 最低信任分阈值(默认0.0不过滤; 已废弃条目一律不返回)。
++    scene: 场景过滤 chat/working/coding(默认""不过滤)。同场景条目加分; 未打标条目兜底保留(scene_fallback=true); 已打标但场景不符的跳过。
++    level: 加载层级 L2=全文(默认) / L0=首句摘要+content_len+truncated标记(省token)。
++    explain: 返回 why 评分分解(向量排名/FTS排名/信任/新鲜度/命中/类型匹配)。
++    dedupe: 合并近重复结果(默认true)。include_pointer: 是否返回 kb_compact 指针文件(默认false, 它们不是知识)。"""
+     t0 = time.time()
+     with _db_lock(15):  # 2026-10-24: 读工具带超时, 锁忙快速报错不挂死
+         col = get_collection()
+-        
+-        if mode == "vector":
+-            vec = embed(query)
+-            raw = col.query(zvec.Query("embedding", vector=vec), topk=topk * 3)
+-        elif mode == "fts":
+-            raw = col.query(zvec.Query("content", fts=zvec.Fts(query_string=query)), topk=topk * 3)
+-        else:  # hybrid
++        candidate_k = max(30, min(120, topk * 6))
++
++        vec_raw, fts_raw = [], []
++        if mode in ("hybrid", "vector"):
+             vec = embed(query)
+-            vec_raw = col.query(zvec.Query("embedding", vector=vec), topk=topk * 3)
+-            fts_raw = col.query(zvec.Query("content", fts=zvec.Fts(query_string=query)), topk=topk * 3)
+-            # 合并: 按 id 去重, score 取 max
+-            merged = {}
+-            for r in vec_raw:
+-                merged[r.id] = r
+-            for r in fts_raw:
+-                if r.id in merged:
+-                    if r.score > merged[r.id].score:
+-                        merged[r.id] = r
+-                else:
+-                    merged[r.id] = r
+-            raw = sorted(merged.values(), key=lambda x: x.score, reverse=True)[:topk * 3]
+-        
++            vec_raw = list(col.query(zvec.Query("embedding", vector=vec), topk=candidate_k))
++        if mode in ("hybrid", "fts"):
++            fts_raw = list(col.query(
++                zvec.Query("content", fts=zvec.Fts(query_string=query)), topk=candidate_k))
++
++        # RRF: 只融合排名, 不混用量纲不同的余弦分与 BM25 分 (memory-brain DESIGN §4)
++        fused = ma.rrf_fuse(vec_raw, fts_raw)
++        doc_by_id = {}
++        for r in vec_raw + fts_raw:
++            doc_by_id[r.id] = r
++
+         results = []
+-        for r in raw:
+-            trust = r.fields.get("trust_score", TRUST_DEFAULT)
++        for doc_id, fusion in fused.items():
++            r = doc_by_id.get(doc_id)
++            if r is None:
++                continue
++            fields = r.fields
++            deprecated = fields.get("deprecated", 0)
++            if isinstance(deprecated, str):
++                try: deprecated = int(deprecated)
++                except: deprecated = 0
++            if deprecated >= 1:
++                continue
++            if not include_pointer and ma.is_pointer_doc(fields):
++                continue
++
++            trust = fields.get("trust_score", TRUST_DEFAULT)
+             if isinstance(trust, str):
+                 try: trust = float(trust)
+                 except: trust = TRUST_DEFAULT
+-            
+-            updated_at = r.fields.get("updated_at", 0)
++            updated_at = fields.get("updated_at", 0)
+             if isinstance(updated_at, str):
+                 try: updated_at = int(updated_at)
+                 except: updated_at = 0
+-            
+-            Deprecated = r.fields.get("deprecated", 0)
+-            if isinstance(Deprecated, str):
+-                try: Deprecated = int(Deprecated)
+-                except: Deprecated = 0
+-
+-            hit_count = r.fields.get("hit_count", 0)
++            hit_count = fields.get("hit_count", 0)
+             if isinstance(hit_count, str):
+                 try: hit_count = int(hit_count)
+                 except: hit_count = 0
+-            
+-            eff_trust = _effective_trust(trust, updated_at)
+-            
+-            # 过滤: 信任分低于阈值 or 已标记废弃
+-            # 2026-10-24: 废弃条目一律不返回(原逻辑仅 min_trust>0 时才过滤,
+-            # 导致 deprecate 掉的指针快照垃圾文档在默认查询里继续霸榜;
+-            # 确需查看废弃条目用 kb_trust list_deprecated)
++
++            # 信任是证据强度, 不是新鲜度; 最低保留 50%, 不再衰减到 0
++            eff_trust = ma.trust_with_floor(trust, updated_at)
+             if eff_trust < min_trust:
+                 continue
+-            if Deprecated >= 1:
+-                continue
+-            
+-            # 复合重排序: semantic + recency + trust + hit_freq
+-            composite = _composite_rescore(r.score, trust, updated_at, hit_count)
+ 
+-            # 场景软过滤 (Hy-Memory scene 借鉴): 同场景加分, 不匹配打标条目跳过, 未打标兜底
+-            entry_scene = _read_scene_field(r.fields)
++            # 场景软过滤: 同场景加分, 不匹配打标条目跳过, 未打标兜底
++            entry_scene = _read_scene_field(fields)
+             scene_fallback = False
++            scene_boost = 0.0
+             if scene and _norm_scene(scene):
+                 if entry_scene and entry_scene != _norm_scene(scene):
+                     continue
+                 if not entry_scene:
+                     scene_fallback = True
+                 else:
+-                    composite = min(1.0, composite + 0.15)
++                    scene_boost = 0.05
+ 
+-            content_full = r.fields.get("content", "")
+-            if level == "L0":
+-                content_out = _make_l0(content_full)
+-            else:
+-                content_out = content_full
+-
+-            results.append({
++            scored = ma.score_memory(fields, fusion["relevance"], query=query, scene_boost=scene_boost)
++            content_full = fields.get("content", "")
++            row = {
+                 "id": r.id,
+-                "score": round(r.score, 4),
+-                "composite_score": round(composite, 4),
+-                "trust_score": round(trust, 2),
++                "score": round(float(r.score or 0.0), 4),
++                "composite_score": scored["score"],
++                "trust_score": round(float(trust), 2),
+                 "effective_trust": round(eff_trust, 2),
+                 "hit_count": hit_count,
+-                "deprecated": Deprecated,
+-                "title": r.fields.get("title", ""),
+-                "content": content_out,
++                "deprecated": deprecated,
++                "title": fields.get("title", ""),
++                "content": content_full,
+                 "content_len": len(content_full),
+-                "truncated": len(content_out) < len(content_full),
+                 "scene": entry_scene,
+                 "scene_fallback": scene_fallback,
+-                "category": r.fields.get("category", ""),
+-            })
+-        
+-        # 按复合评分降序
++                "category": fields.get("category", ""),
++                "kind": ma.kind_name(fields.get("kind", 0)) or None,
++            }
++            if explain:
++                row["why"] = {
++                    **scored["why"],
++                    "vector_rank": fusion.get("vector_rank", 0),
++                    "fts_rank": fusion.get("fts_rank", 0),
++                    "rrf": round(float(fusion.get("rrf", 0.0)), 5),
++                }
++            results.append(row)
++
+         results.sort(key=lambda x: x["composite_score"], reverse=True)
+-        
+-        # 命中频率追踪: 对返回的 top-K 条目递增 hit_count
+-        # 注意: 仅更新 hit_count, 不动 updated_at (避免搜索行为污染时间衰减)
++        if dedupe:
++            results = ma.dedupe_results(results, threshold=0.88, text_key="content")
++
++        top = results[:topk]
++        for row in top:
++            if level == "L0":
++                row["content"] = _make_l0(row["content"])
++                row["truncated"] = len(row["content"]) < row["content_len"]
++            else:
++                row["truncated"] = False
++
++        # 命中频率追踪: 只更新 hit_count, 不动 updated_at
+         try:
+             col.update([
+-                zvec.Doc(id=r["id"], fields={"hit_count": r["hit_count"] + 1})
+-                for r in results[:topk]
++                zvec.Doc(id=row["id"], fields={"hit_count": row["hit_count"] + 1})
++                for row in top
+             ])
+         except Exception:
+-            pass  # hit_count 追踪是增强, 失败不影响搜索
+-    
++            pass
++
+     elapsed = round((time.time() - t0) * 1000)
+     _record_metric("search_calls", elapsed)
+-    return {"results": results[:topk], "elapsed_ms": elapsed, "total": len(results), "mode": mode,
+-            "min_trust": min_trust, "scene": _norm_scene(scene) or None, "level": level}
++    return {"results": top, "elapsed_ms": elapsed, "total": len(results), "mode": mode,
++            "min_trust": min_trust, "scene": _norm_scene(scene) or None, "level": level,
++            "fusion": "rrf" if mode == "hybrid" else mode}
++
+ 
+ 
+ def _semantic_gate_judge(new_content: str, candidates: list):
+@@ -601,24 +629,34 @@
+ 
+ @mcp.tool()
+ def kb_add(content: str, category: str = "general", title: str = "", suppress_duplicates: bool = True,
+-           semantic_gate: bool = True, gate_topk: int = 3, scene: str = "") -> dict:
++           semantic_gate: bool = True, gate_topk: int = 3, scene: str = "", kind: str = "") -> dict:
+     """写入新知识到Hermes知识库。content:知识内容, category:分类(rules/services/infrastructure/development/general), title:标题(可选,默认取content前30字), suppress_duplicates:是否抑制重复内容(默认true)
+     semantic_gate: 写入前语义对比闸门(默认true) — 检索最相似 top-k, LLM 判定 duplicate(重复)/conflict(矛盾,给winner)/complement(互补)。
+     conflict 且新内容为输 → 拒绝写入并返回裁决; gate_topk: 语义对比的候选数(默认3)。会增加 2-5s LLM 延迟。
+-    scene: 场景标注 chat/working/coding(默认""不标注, 兼容存量)。生产力任务结果写 working, 代码修复/技术决策写 coding, 偏好/闲聊事实写 chat。"""
++    scene: 场景标注 chat/working/coding(默认""不标注, 兼容存量)。生产力任务结果写 working, 代码修复/技术决策写 coding, 偏好/闲聊事实写 chat。
++    kind: 记忆类型 fact/episode/preference/lesson/rule/profile/task(默认""自动推断, 借鉴 memory-brain 五类记忆)。"""
+     t0 = time.time()
+     col = get_collection()
+     if not title:
+         title = content[:30]
+-    
++    kind_code = ma.kind_code(kind) or ma.infer_kind(category, title, content, scene)
++
+     content_hash = hashlib.md5(content.encode()).hexdigest()[:12]
++    norm_hash = ma.content_fingerprint(content)
++    pre_vec = None
+     
+     # 去重检查: 相同content_hash的条目已存在
++    if suppress_duplicates:
++        pre_vec = embed(title + " " + content)
+     with _zvec_lock:
+         if suppress_duplicates:
+             all_docs = col.query(zvec.Query("embedding", vector=[0.0]*384), topk=10000)
+             for r in all_docs:
+-                if r.fields.get("content_hash") == content_hash:
++                same = r.fields.get("content_hash") == content_hash
++                if not same:
++                    # 标点/空白差异也算同一条 (memory-brain: 指纹比 md5 原文更稳)
++                    same = ma.content_fingerprint(r.fields.get("content", "")) == norm_hash
++                if same:
+                     existing_trust = r.fields.get("trust_score", TRUST_DEFAULT)
+                     # 相同内容再次写入 → 确认强化 (boost trust)
+                     try:
+@@ -632,12 +670,38 @@
+                     elapsed = round((time.time() - t0) * 1000)
+                     _record_metric("add_calls", elapsed)
+                     return {"id": r.id, "title": title, "category": category, "status": "confirmed", "trust": round(new_trust, 2)}
+-        
++
++            # 语义近重复早停: 向量 >=0.96 直接确认, 不进 LLM 闸门 (防 kb_import 绕过)
++            if pre_vec is not None:
++                try:
++                    near = col.query(zvec.Query("embedding", vector=pre_vec), topk=3)
++                    for r in near:
++                        dep = r.fields.get("deprecated", 0)
++                        if isinstance(dep, str) and dep.isdigit():
++                            dep = int(dep)
++                        if dep >= 1:
++                            continue
++                        if float(r.score) >= 0.96:
++                            old_trust = r.fields.get("trust_score", TRUST_DEFAULT)
++                            try:
++                                new_trust = min(1.0, float(old_trust) + TRUST_CONFIRM_BOOST)
++                            except:
++                                new_trust = TRUST_DEFAULT
++                            col.update([zvec.Doc(id=r.id, fields={
++                                "trust_score": new_trust, "updated_at": int(time.time())})])
++                            elapsed = round((time.time() - t0) * 1000)
++                            _record_metric("add_calls", elapsed)
++                            return {"id": r.id, "title": r.fields.get("title", ""), "category": category,
++                                    "status": "confirmed_near_duplicate", "trust": round(new_trust, 2),
++                                    "similarity": round(float(r.score), 4)}
++                except Exception:
++                    pass
++
+         # === 语义闸门 (2026-09-09): 持锁检索相似候选 (LLM 仲裁在锁外) ===
+         gate_result = None
+         gate_candidates = []
+         if semantic_gate:
+-            vec = embed(title + " " + content)
++            vec = pre_vec if pre_vec is not None else embed(title + " " + content)
+             sim_raw = col.query(zvec.Query("embedding", vector=vec), topk=gate_topk)
+             for r in sim_raw:
+                 dep = r.fields.get("deprecated", 0)
+@@ -702,7 +766,7 @@
+ 
+     # 新条目 (回锁落库)
+     full_text = title + " " + content
+-    emb = embed(full_text)
++    emb = pre_vec if pre_vec is not None else embed(full_text)
+     
+     doc_id = f"kb_{int(time.time())}_{content_hash}"
+     doc = zvec.Doc(
+@@ -713,6 +777,7 @@
+             "trust_score": TRUST_DEFAULT, "updated_at": int(time.time()),
+             "deprecated": 0, "hit_count": 0,
+             "scene": _scene_code(scene),
++            "kind": kind_code,
+         }
+     )
+     with _zvec_lock:
+@@ -722,7 +787,7 @@
+         _sync_doc_to_md(zvec.Doc(id=doc_id, fields={
+             "title": title, "content": content, "category": category,
+             "trust_score": TRUST_DEFAULT, "updated_at": int(time.time()), "deprecated": 0,
+-            "scene": _scene_code(scene),
++            "scene": _scene_code(scene), "kind": kind_code,
+         }))
+     except Exception as e:
+         print(f"[MCP-KB] md镜像同步失败: {e}", file=sys.stderr, flush=True)
+@@ -730,7 +795,7 @@
+     elapsed = round((time.time() - t0) * 1000)
+     _record_metric("add_calls", elapsed)
+     return {"id": doc_id, "title": title, "category": category, "status": "ok", "trust": TRUST_DEFAULT,
+-            "scene": _norm_scene(scene) or None}
++            "scene": _norm_scene(scene) or None, "kind": ma.kind_name(kind_code) or None}
+ 
+ 
+ @mcp.tool()
+@@ -784,39 +849,54 @@
+ 
+ 
+ @mcp.tool()
+-def kb_import(entries: list, category: str = "general", auto_title: bool = True, scene: str = "") -> dict:
+-    """批量写入多条知识到知识库(每条独立去重)。entries: 字符串列表(每条一段内容, 共享category) 或 [{"content":..., "category":..., "title":..., "scene":...}] 列表。auto_title: 未提供title时取content前30字(默认true)。scene: 场景标注 chat/working/coding(默认""不标注), 条目内 scene 可逐条覆盖。返回每条的写入结果。"""
++def kb_import(entries: list, category: str = "general", auto_title: bool = True, scene: str = "",
++              kind: str = "", dup_threshold: float = 0.94) -> dict:
++    """批量写入多条知识到知识库(每条独立去重)。entries: 字符串列表(每条一段内容, 共享category) 或 [{"content":..., "category":..., "title":..., "scene":..., "kind":...}] 列表。
++    auto_title: 未提供title时取content前30字(默认true)。scene: 场景标注 chat/working/coding(默认""不标注), 条目内 scene 可逐条覆盖。
++    kind: 记忆类型 fact/episode/preference/lesson/rule/profile/task(默认""自动推断)。
++    dup_threshold: 批量写入的向量近重复阈值(默认0.94; 高于此值视为同一条并 confirm, 不进 LLM)。
++    返回每条的写入结果。"""
+     t0 = time.time()
+     results = []
+     added = 0
+     confirmed = 0
+     with _zvec_lock:
+         col = get_collection()
++        existing_docs = list(_iter_all_docs(col))
++        hash_map = {r.fields.get("content_hash", ""): r.id for r in existing_docs if r.fields.get("content_hash")}
++        fp_map = {}
++        for r in existing_docs:
++            fp = ma.content_fingerprint(r.fields.get("content", ""))
++            if fp:
++                fp_map.setdefault(fp, r.id)
++
+         for e in entries:
+             if isinstance(e, dict):
+                 content = e.get("content", "")
+                 cat = e.get("category", category)
+                 title = e.get("title", "")
+                 ent_scene = e.get("scene", scene)
++                ent_kind = e.get("kind", kind)
+             else:
+                 content = str(e)
+                 cat = category
+                 title = ""
+                 ent_scene = scene
++                ent_kind = kind
+             ent_scene = _norm_scene(ent_scene)
+             if not content.strip():
+                 continue
+             if not title and auto_title:
+                 title = content[:30]
+             content_hash = hashlib.md5(content.encode()).hexdigest()[:12]
+-            # 去重: 相同 content_hash 已存在 → boost
+-            dup_id = None
+-            for r in _iter_all_docs(col):
+-                if r.fields.get("content_hash") == content_hash:
+-                    dup_id = r.id
+-                    break
++            fingerprint = ma.content_fingerprint(content)
++            kind_code = ma.kind_code(ent_kind) or ma.infer_kind(cat, title, content, ent_scene)
++
++            # 1) 精确 hash / 标点归一指纹去重
++            dup_id = hash_map.get(content_hash) or fp_map.get(fingerprint)
+             if dup_id:
+-                existing_trust = r.fields.get("trust_score", TRUST_DEFAULT)
++                r = next((d for d in existing_docs if d.id == dup_id), None)
++                existing_trust = (r.fields.get("trust_score", TRUST_DEFAULT) if r else TRUST_DEFAULT)
+                 try:
+                     new_trust = min(1.0, float(existing_trust) + TRUST_CONFIRM_BOOST)
+                 except Exception:
+@@ -825,9 +905,28 @@
+                 results.append({"title": title, "category": cat, "status": "confirmed", "id": dup_id})
+                 confirmed += 1
+                 continue
+-            # 新条目
++
++            # 2) 向量近重复: 批量导入最容易绕过语义闸门，这里做一道廉价闸
+             full_text = title + " " + content
+             emb = embed(full_text)
++            dup_id = None
++            try:
++                near = col.query(zvec.Query("embedding", vector=emb), topk=1)
++                if near and float(near[0].score) >= dup_threshold:
++                    dep = near[0].fields.get("deprecated", 0)
++                    if isinstance(dep, str) and dep.isdigit():
++                        dep = int(dep)
++                    if dep < 1:
++                        dup_id = near[0].id
++            except Exception:
++                pass
++            if dup_id:
++                col.update([zvec.Doc(id=dup_id, fields={"trust_score": TRUST_DEFAULT, "updated_at": int(time.time())})])
++                results.append({"title": title, "category": cat, "status": "confirmed_near_duplicate", "id": dup_id})
++                confirmed += 1
++                continue
++
++            # 3) 新条目
+             doc_id = f"kb_{int(time.time())}_{content_hash}"
+             col.insert([zvec.Doc(
+                 id=doc_id, vectors={"embedding": emb},
+@@ -837,23 +936,28 @@
+                     "trust_score": TRUST_DEFAULT, "updated_at": int(time.time()),
+                     "deprecated": 0, "hit_count": 0,
+                     "scene": _scene_code(ent_scene),
++                    "kind": kind_code,
+                 }
+             )])
++            hash_map[content_hash] = doc_id
++            fp_map[fingerprint] = doc_id
+             try:
+                 _sync_doc_to_md(zvec.Doc(id=doc_id, fields={
+                     "title": title, "content": content, "category": cat,
+                     "trust_score": TRUST_DEFAULT, "updated_at": int(time.time()), "deprecated": 0, "hit_count": 0,
+-                    "scene": _scene_code(ent_scene),
++                    "scene": _scene_code(ent_scene), "kind": kind_code,
+                 }))
+             except Exception as e:
+                 print(f"[MCP-KB] md镜像同步失败: {e}", file=sys.stderr, flush=True)
+-            results.append({"title": title, "category": cat, "status": "ok", "id": doc_id})
++            results.append({"title": title, "category": cat, "status": "ok", "id": doc_id,
++                            "kind": ma.kind_name(kind_code) or None})
+             added += 1
+     elapsed = round((time.time() - t0) * 1000)
+     _record_metric("import_calls", elapsed)
+     return {"total": len(results), "added": added, "confirmed": confirmed, "results": results, "elapsed_ms": elapsed}
+ 
+ 
++
+ @mcp.tool()
+ def kb_trust(action: str, fact_id: str = "", query: str = "", category: str = "") -> dict:
+     """管理知识库中条目的信任评分。action: confirm(确认强化)/contradict(矛盾降权)/deprecate(标记废弃)/restore(恢复)/list_deprecated(列出废弃)/list_low_trust(列出低信任)/reset_all(紧急重置所有)/restore_all(恢复所有到1.0)。fact_id:针对单条操作 / query:按语义匹配操作 / category:按分类批量操作"""
+@@ -978,6 +1082,8 @@
+         trust_buckets = {"high_0.7+": 0, "medium_0.3-0.7": 0, "low_0.0-0.3": 0, "deprecated": 0}
+         categories = {}
+         scene_counts = {"chat": 0, "working": 0, "coding": 0, "unlabeled": 0}
++        kind_counts = {}
++        pointer_count = 0
+         
+         for r in all_docs:
+             trust = r.fields.get("trust_score", TRUST_DEFAULT)
+@@ -1000,6 +1106,10 @@
+             categories[cat] = categories.get(cat, 0) + 1
+             sc = _read_scene_field(r.fields)
+             scene_counts[sc if sc else "unlabeled"] += 1
++            kn = ma.kind_name(r.fields.get("kind", 0)) or "unspecified"
++            kind_counts[kn] = kind_counts.get(kn, 0) + 1
++            if dep < 1 and ma.is_pointer_doc(r.fields):
++                pointer_count += 1
+     
+     elapsed = round((time.time() - t0) * 1000)
+     
+@@ -1013,18 +1123,167 @@
+         "trust_distribution": trust_buckets,
+         "categories": categories,
+         "scene_distribution": scene_counts,
++        "kind_distribution": kind_counts,
++        "pointer_artifacts": pointer_count,
+         "metrics": metrics_copy,
+     }
+ 
+ 
++def _load_views(col) -> list:
++    """Load all docs with vectors for consolidation/health analysis."""
++    return list(col.iter_docs(include_vector=True))
++
++
++def _batch_update(col, docs: list, size: int = 500) -> None:
++    """zvec 单次写入上限 1024 条; 全库回填/批量废弃必须分片."""
++    for i in range(0, len(docs), max(1, int(size))):
++        col.update(docs[i:i + size])
++
++
++def _batch_delete(col, ids: list, size: int = 500) -> None:
++    for i in range(0, len(ids), max(1, int(size))):
++        col.delete(ids[i:i + size])
++
++
+ @mcp.tool()
+-def kb_optimize(deprecate_days: int = 90, cleanup_days: int = 180) -> dict:
+-    """优化知识库: 自动废弃超过N天未更新的条目 + 物理删除已废弃超过M天的条目。deprecate_days: 自动废弃阈值(默认90天), cleanup_days: 物理删除阈值(默认180天)"""
++def kb_health(dup_threshold: float = 0.92, stale_days: int = 365, fix: bool = False) -> dict:
++    """知识库体检 (memory-brain health.py 适配版): 重复/指针垃圾/低信任/类型缺失/超大条目。
++
++    dup_threshold: 近重复判定阈值(默认0.92)
++    stale_days: 低信任条目的“陈旧”天数(默认365, 只影响报告与 fix 的候选)
++    fix: 是否顺手废弃安全候选(指针文件 + 长期低信任零命中条目), 默认false只报告。
++    返回 health_score(0-100) + issues + 分类/类型分布。"""
+     t0 = time.time()
++    with _db_lock(60):
++        col = get_collection()
++        docs = _load_views(col)
++        report = ma.health_report(docs, dup_threshold=dup_threshold, stale_days=stale_days)
++        actions = []
++        if fix:
++            candidates = ma.select_forgetting(docs, stale_days=stale_days, min_trust=0.5)
++            if candidates:
++                now = int(time.time())
++                _batch_update(col, [zvec.Doc(id=c["id"], fields={
++                    "deprecated": 1, "trust_score": 0.0, "updated_at": now,
++                }) for c in candidates])
++                actions = [{"id": c["id"], "reason": c["reason"]} for c in candidates]
++    elapsed = round((time.time() - t0) * 1000)
++    _record_metric("health_calls", elapsed)
++    return {**report, "actions": actions, "fix": fix,
++            "elapsed_ms": elapsed}
++
++
++@mcp.tool()
++def kb_dedup(threshold: float = 0.92, dry_run: bool = True, same_category: bool = True,
++             purge: bool = False, max_groups: int = 100) -> dict:
++    """语义去重/合并 (memory-brain consolidate.py 适配版)。
++
++    threshold: 余弦相似度阈值(默认0.92; 0.95=几乎同文, 0.88=同主题不同措辞)
++    dry_run: 默认true只返回合并计划, 不改库; false 才执行
++    same_category: 默认true只合并同分类, 避免把 user 偏好并进 memory 任务记录
++    purge: 合并后是否物理删除 loser(默认false, 软废弃可恢复)
++    保留策略: trust 最高 → hit_count 最多 → 内容最长; 合并 hit_count 并保留最长正文。
++    """
++    t0 = time.time()
++    with _db_lock(120):
++        col = get_collection()
++        docs = _load_views(col)
++        clusters = ma.duplicate_clusters(docs, threshold=threshold, same_category=same_category)
++        clusters = clusters[:max(1, int(max_groups))]
++        plans = []
++        for cluster in clusters:
++            plan = ma.merge_plan(cluster, docs)
++            titles = {str(docs[i].fields.get("title", ""))[:50] for i in cluster}
++            plans.append({
++                "keep_id": plan["keep_id"],
++                "drop_ids": plan["drop_ids"],
++                "size": plan["size"],
++                "titles": list(titles)[:6],
++                "keep_preview": plan["keep_fields"]["content"][:120],
++            })
++            if not dry_run:
++                keep = zvec.Doc(id=plan["keep_id"], fields=plan["keep_fields"])
++                losers = [zvec.Doc(id=i, fields={"deprecated": 1, "trust_score": 0.0,
++                                                 "updated_at": int(time.time())})
++                          for i in plan["drop_ids"]]
++                col.update([keep] + losers)
++                try:
++                    _sync_doc_to_md(keep)
++                except Exception:
++                    pass
++                for drop_id in plan["drop_ids"]:
++                    if purge:
++                        try:
++                            col.delete([drop_id])
++                        except Exception:
++                            pass
++    elapsed = round((time.time() - t0) * 1000)
++    _record_metric("dedup_calls", elapsed)
++    return {
++        "threshold": threshold, "same_category": same_category, "dry_run": dry_run,
++        "groups": len(plans), "docs_in_groups": sum(p["size"] for p in plans),
++        "would_merge" if dry_run else "merged": sum(p["size"] - 1 for p in plans),
++        "plans": plans, "elapsed_ms": elapsed,
++    }
++
++
++@mcp.tool()
++def kb_reindex(limit: int = 5000, force: bool = False) -> dict:
++    """回填记忆类型 kind 字段: 按 category/title/content 规则推断 (fact/episode/preference/lesson/rule/profile/task)。
++
++    limit: 单次最多处理条数(默认5000)。幂等, 可重复运行; 默认只处理 kind=0 的条目。
++    force: true 时对所有条目重新推断(规则升级后修正旧标签用)。
++    """
++    t0 = time.time()
++    with _db_lock(120):
++        col = get_collection()
++        docs = list(_iter_all_docs(col))
++        updates = []
++        counts = {}
++        for r in docs[:max(1, int(limit))]:
++            if not force and int(r.fields.get("kind", 0) or 0) != 0:
++                continue
++            code = ma.infer_kind(r.fields.get("category", ""), r.fields.get("title", ""),
++                                 r.fields.get("content", ""), _read_scene_field(r.fields))
++            if not force and code == int(r.fields.get("kind", 0) or 0):
++                continue
++            updates.append(zvec.Doc(id=r.id, fields={"kind": code}))
++            name = ma.kind_name(code) or "unspecified"
++            counts[name] = counts.get(name, 0) + 1
++        if updates:
++            _batch_update(col, updates)
++    elapsed = round((time.time() - t0) * 1000)
++    _record_metric("reindex_calls", elapsed)
++    return {"updated": len(updates), "kinds": counts, "elapsed_ms": elapsed}
++
++
++@mcp.tool()
++def kb_optimize(deprecate_days: int = 365, cleanup_days: int = 730,
++                dedupe: bool = False, dedupe_threshold: float = 0.92) -> dict:
++    """优化知识库: 保守遗忘(指针垃圾 + 长期低信任零命中) + 物理清理已废弃条目 + 可选语义去重。
++    deprecate_days: 低信任条目的陈旧阈值(默认365天; 不再按90天一刀切)
++    cleanup_days: 物理删除已废弃条目的天数(默认730天)
++    dedupe: 是否同时执行语义合并(默认false; 合并前建议先 kb_dedup dry_run 预览)
++    """
++    t0 = time.time()
++    dedupe_result = None
+     with _db_lock(60):  # kb_optimize 是全库扫描+清理, 给长超时; 超时仍快速报错不挂死
+         col = get_collection()
+-        deprecated_count = _auto_deprecate(col)
++        deprecated_count = _auto_deprecate(col, stale_days=deprecate_days)
+         cleaned_count = _cleanup_deprecated(col, days=cleanup_days)
++        if dedupe:
++            docs = _load_views(col)
++            clusters = ma.duplicate_clusters(docs, threshold=dedupe_threshold, same_category=True)
++            merged = 0
++            for cluster in clusters:
++                plan = ma.merge_plan(cluster, docs)
++                col.update([zvec.Doc(id=plan["keep_id"], fields=plan["keep_fields"])] +
++                           [zvec.Doc(id=i, fields={"deprecated": 1, "trust_score": 0.0,
++                                                   "updated_at": int(time.time())})
++                            for i in plan["drop_ids"]])
++                merged += len(plan["drop_ids"])
++            dedupe_result = {"groups": len(clusters), "merged": merged,
++                             "threshold": dedupe_threshold}
+         final_count = col.stats.doc_count
+     
+     elapsed = round((time.time() - t0) * 1000)
+@@ -1032,6 +1291,7 @@
+     return {
+         "auto_deprecated": deprecated_count,
+         "cleaned": cleaned_count,
++        "dedupe": dedupe_result,
+         "final_doc_count": final_count,
+         "deprecate_threshold_days": deprecate_days,
+         "cleanup_threshold_days": cleanup_days,
+@@ -1717,7 +1977,12 @@
+     content = path.read_text(encoding="utf-8").strip()
+     # 2026-10-24: 剔除指针头行(← 开头, 历史 compact 产物) — 否则指针文件本身
+     # 被当知识反复入库, 且标题以'←'开头霸占各类查询榜首
+-    content = "\n".join(l for l in content.splitlines() if not l.lstrip().startswith("←"))
++    # 2026-11-07: 同时剔除 "→KB: kb搜..." 导航行 — 旧逻辑会把指针文件再压一次,
++    # 标题递归长成 "- - - 指针头…", 成为搜索噪声。派生索引不是知识。
++    content = "\n".join(
++        l for l in content.splitlines()
++        if not l.lstrip().startswith("←") and "→KB: kb搜" not in l
++    )
+     if not content.strip():
+         return {"checked": 0, "added": 0, "confirmed": 0, "compressed": False}
+ 
+@@ -1738,6 +2003,7 @@
+             full_text = title + " " + seg
+             emb = embed(full_text)
+             doc_id = f"kb_{int(time.time())}_{chash}"
++            kind_code = ma.infer_kind(category, title, seg)
+             col.insert([zvec.Doc(
+                 id=doc_id, vectors={"embedding": emb},
+                 fields={
+@@ -1746,13 +2012,14 @@
+                     "trust_score": TRUST_DEFAULT, "updated_at": int(time.time()),
+                     "deprecated": 0, "hit_count": 0,
+                     "scene": 0,  # 2026-10-24: schema 要求 scene 必填(10-23 加的列), 缺了 insert 直接失败 → 自动精简自 10-23 起全挂
++                    "kind": kind_code,
+                 }
+             )])
+             try:
+                 _sync_doc_to_md(zvec.Doc(id=doc_id, fields={
+                     "title": title, "content": seg, "category": category,
+                     "trust_score": TRUST_DEFAULT, "updated_at": int(time.time()), "deprecated": 0, "hit_count": 0,
+-                    "scene": 0,
++                    "scene": 0, "kind": kind_code,
+                 }))
+             except Exception:
+                 pass
+@@ -1848,7 +2115,7 @@
+             with _zvec_lock:
+                 col = get_collection()
+                 deprecated_count = _auto_deprecate(col)
+-                cleaned_count = _cleanup_deprecated(col, days=180)
++                cleaned_count = _cleanup_deprecated(col, days=730)
+                 final_count = col.stats.doc_count
+             # 同步 Obsidian md 目录树镜像 (清理孤儿 + 生成README索引)
+             try:
