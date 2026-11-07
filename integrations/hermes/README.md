@@ -20,19 +20,22 @@ Hermes 的 `kb_compact` 会把 MEMORY.md 压成「主题 → `kb搜'…'`」指�
 ## 安装到 Hermes KB
 
 ```bash
-cp integrations/hermes/memory_adapt.py ~/hermes-kb/
-# 然后按 patches/mcp_server.patch 接线，或直接使用已适配的 mcp_server.py
+cd ~/hermes-kb
+cp mcp_server.py mcp_server.py.bak-$(date +%Y%m%d_%H%M%S)
+patch -p1 < /path/to/memory-brain/integrations/hermes/patches/mcp_server.patch
+cp /path/to/memory-brain/integrations/hermes/memory_adapt.py .
 systemctl --user restart kb-http.service
 ```
 
-实际接线点（`~/hermes-kb/mcp_server.py`）：
+补丁基于 2026-11-07 的 `~/hermes-kb/mcp_server.py`（2178 行版本）。如果上游/本机版本不同，按下面的接线点手动合并：
 
 1. schema 增加 `kind`（INT32，0=未标注）；
 2. `kb_search` 用 `rrf_fuse` + `score_memory` + `dedupe_results`；
 3. `kb_add` / `kb_import` 增加 kind 推断与指纹级去重；
 4. 新增 `kb_health`、`kb_dedup`、`kb_reindex`；
 5. `_auto_deprecate` 换成 `select_forgetting`；
-6. `_compact_memory_file` 过滤指针行，避免递归入库。
+6. `_compact_memory_file` 过滤指针行，避免递归入库；
+7. zvec 单次写入上限 1024 条：全库更新用 `_batch_update` / `_batch_delete` 分片。
 
 ## 测试
 

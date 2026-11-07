@@ -1,5 +1,5 @@
---- /root/hermes-kb/mcp_server.py.bak-20261107_201548	2026-11-07 20:15:48.889510436 +0800
-+++ /root/hermes-kb/mcp_server.py	2026-11-07 20:22:12.816511352 +0800
+--- a/mcp_server.py
++++ b/mcp_server.py
 @@ -28,6 +28,9 @@
  from mcp.server.mcpserver import MCPServer
  from sentence_transformers import SentenceTransformer
