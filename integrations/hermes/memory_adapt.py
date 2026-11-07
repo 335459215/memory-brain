@@ -404,7 +404,7 @@ def dedupe_results(rows: list[dict], threshold: float = 0.88,
             ktext = str(k.get(text_key) or "")
             ktitle = str(k.get("title") or "")
             if (bigram_similarity(text, ktext) >= threshold
-                    or (title and ktitle and bigram_similarity(title, ktitle) >= 0.90)):
+                    or (title and ktitle and bigram_similarity(title, ktitle) >= 0.95)):
                 is_dup = True
                 break
         if not is_dup:
