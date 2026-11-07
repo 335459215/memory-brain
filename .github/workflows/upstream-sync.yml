@@ -1,0 +1,47 @@
+name: upstream-sync
+
+# Keep this fork close to peterpoal134/memory-brain.
+# - main mirrors upstream plus fork-only CI (this workflow).
+# - hermes-adapt is our integration branch; upstream changes are merged in
+#   automatically. Conflicts fail the job (GitHub notification) instead of
+#   silently dropping either side.
+on:
+  schedule:
+    - cron: "17 3 * * *"   # daily 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream/main into main
+        run: |
+          git remote add upstream https://github.com/peterpoal134/memory-brain.git
+          git fetch upstream main
+          git checkout main
+          git merge --no-edit upstream/main
+          git push origin main
+
+      - name: Merge main into hermes-adapt
+        run: |
+          if git ls-remote --heads origin hermes-adapt | grep -q hermes-adapt; then
+            git fetch origin hermes-adapt
+            git checkout -B hermes-adapt origin/hermes-adapt
+            git merge --no-edit origin/main
+            git push origin hermes-adapt
+          else
+            echo "hermes-adapt branch does not exist yet; skipping"
+          fi
