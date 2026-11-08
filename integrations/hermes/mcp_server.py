@@ -305,6 +305,17 @@ def _scene_code(scene) -> int:
     return _SCENE_CODE.get(_norm_scene(scene), 0)
 
 
+# zvec FTS 解析器是带括号分组的表达式语法: ':' '^' 直接语法错误, 不平衡的
+# '(' ')' 报 missing ')', 任何"用户原话"当 query 都可能让整个 kb_search 崩
+# (实测含冒号的标题/query 批量触发)。白名单消毒: 只留 字母/数字/CJK/下划线/
+# 空格, 其余一律变空格 — 标点损失由向量检索腿补, 消毒后为空则跳过 FTS 腿。
+_FTS_BREAK_CHARS = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff\u3400-\u4dbf_ ]+")
+
+
+def _sanitize_fts_query(q: str) -> str:
+    return " ".join(_FTS_BREAK_CHARS.sub(" ", q or "").split())
+
+
 def _read_scene_field(fields: dict) -> str:
     """从 zvec 行读 scene 字段(可能是 int 码/str), 归一化为字符串"""
     raw = fields.get("scene", "")
@@ -497,8 +508,10 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
             vec = embed(query)
             vec_raw = list(col.query(zvec.Query("embedding", vector=vec), topk=candidate_k))
         if mode in ("hybrid", "fts"):
-            fts_raw = list(col.query(
-                zvec.Query("content", fts=zvec.Fts(query_string=query)), topk=candidate_k))
+            fts_q = _sanitize_fts_query(query)
+            if fts_q:
+                fts_raw = list(col.query(
+                    zvec.Query("content", fts=zvec.Fts(query_string=fts_q)), topk=candidate_k))
 
         # RRF: 只融合排名, 不混用量纲不同的余弦分与 BM25 分 (memory-brain DESIGN §4)
         fused = ma.rrf_fuse(vec_raw, fts_raw)
@@ -1780,7 +1793,8 @@ def kb_conflicts(query: str, topk: int = 15, score_gap_pct: float = 30.0,
         stats_snapshot = _kb_stats_snapshot(col)
         vec = embed(query)
         vec_raw = col.query(zvec.Query("embedding", vector=vec), topk=topk)
-        fts_raw = col.query(zvec.Query("content", fts=zvec.Fts(query_string=query)), topk=topk)
+        fts_q = _sanitize_fts_query(query)
+        fts_raw = col.query(zvec.Query("content", fts=zvec.Fts(query_string=fts_q)), topk=topk) if fts_q else []
         merged = {}
         for r in vec_raw:
             merged[r.id] = r
