@@ -12,7 +12,7 @@ ZVec + ONNX ARM64-int8 + 信任评分 — 搜索延迟~10ms
 启动时预加载模型+DB + 自动schema迁移 → 首次工具调用即达热延迟
 """
 
-import os, sys, warnings, hashlib, time, re, threading
+import os, sys, warnings, hashlib, time, re, math, threading
 from contextlib import contextmanager
 warnings.filterwarnings("ignore")
 from pathlib import Path
@@ -32,6 +32,26 @@ from mcp.server.mcpserver import MCPServer
 
 # memory-brain 适配层 (RRF 混合检索 / 记忆类型 / 合并 / 体检 / 保守遗忘)
 import memory_adapt as ma
+
+# 时间感知召回 (2026-11-08): query 时间表达 → 时间窗后过滤。
+# 防御式导入: 模块缺失/损坏不拖死 server (照 onnx_embedder 的兜底教训)。
+try:
+    import time_recall as tr
+except Exception as _e:
+    tr = None
+    print(f"[MCP-KB] time_recall 不可用 ({_e}), 时间窗召回禁用", file=sys.stderr, flush=True)
+
+# 实体图谱 (2026-11-08): SQLite 边车库, query 实体 → 关联文档加分 + kb_graph 查询。
+# 防御式导入: 模块缺失/损坏不拖死 server。
+try:
+    import entity_graph as eg
+except Exception as _e:
+    eg = None
+    print(f"[MCP-KB] entity_graph 不可用 ({_e}), 实体加分/图谱禁用", file=sys.stderr, flush=True)
+
+ENTITY_BOOST = float(os.environ.get("KB_ENTITY_BOOST", "0.06"))  # query 命中词典实体的关联文档加分 (与 scene_boost 同量级); KB_ENTITY_BOOST=0 可关 (受控 A/B 用)
+ENTITY_ON = os.environ.get("KB_ENTITY_BOOST", "1") not in ("0", "false", "off")
+TIME_ON = os.environ.get("KB_TIME_FILTER", "1") not in ("0", "false", "off")
 
 # Obsidian 兼容的 markdown 镜像目录 (kb_export 导出 / kb_add 同步)
 NOTES_ROOT = Path(os.environ.get("KB_NOTES_ROOT", "/root/hermes-kb/notes"))
@@ -492,9 +512,11 @@ def _iter_all_docs(col):
 @mcp.tool()
 def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float = 0.0,
               scene: str = "", level: str = "L2", explain: bool = False,
-              dedupe: bool = True, include_pointer: bool = False) -> dict:
+              dedupe: bool = True, include_pointer: bool = False,
+              time_filter: str = "") -> dict:
     """搜索Hermes知识库。mode: hybrid(默认,向量+FTS RRF融合)/vector(语义)/fts(全文)。min_trust: 最低信任分阈值(默认0.0不过滤; 已废弃条目一律不返回)。
     scene: 场景过滤 chat/working/coding(默认""不过滤)。同场景条目加分; 未打标条目兜底保留(scene_fallback=true); 已打标但场景不符的跳过。
+    time_filter: 时间窗过滤。自动识别 query 里的相对时间表达(昨天/上周/最近3天/3天前/上半年...); 绝对日期不自动识别(文档标题常嵌日期会误判), 需显式指定: '7d'/'2w'/'3m'/'1y'/'2026-11-08'/'2026-11'/'all'(不过滤)。窗口内命中0条才回退全量并打标 time_fallback=true。
     level: 加载层级 L2=全文(默认) / L0=首句摘要+content_len+truncated标记(省token)。
     explain: 返回 why 评分分解(向量排名/FTS排名/信任/新鲜度/命中/类型匹配)。
     dedupe: 合并近重复结果(默认true)。include_pointer: 是否返回 kb_compact 指针文件(默认false, 它们不是知识)。"""
@@ -518,6 +540,23 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
         doc_by_id = {}
         for r in vec_raw + fts_raw:
             doc_by_id[r.id] = r
+
+        # 实体图谱 boost (2026-11-08): query 命中的词典实体 (最多2个, 罕见的优先)
+        # → 其关联文档按 idf 加权加分 (罕见实体强信号, 烂大街实体几乎不加 —
+        # 平铺加分实测会把时间窗内的相邻文档顶上来, time 集 hit@1 -0.17)。
+        # 异常/无词典时静默跳过, 不影响检索主路径。
+        q_entities, boost_by_doc = [], {}
+        if eg is not None and ENTITY_ON:
+            try:
+                detailed = eg.entities_in_detailed(query)
+                q_entities = [n for n, _ in detailed]
+                for name, df in detailed:
+                    w = ENTITY_BOOST / (1.0 + math.log2(max(2, df)))
+                    for did in eg.docs_for(name, limit=400):
+                        if w > boost_by_doc.get(did, 0.0):
+                            boost_by_doc[did] = w
+            except Exception:
+                q_entities, boost_by_doc = [], {}
 
         results = []
         for doc_id, fusion in fused.items():
@@ -564,7 +603,9 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
                 else:
                     scene_boost = 0.05
 
-            scored = ma.score_memory(fields, fusion["relevance"], query=query, scene_boost=scene_boost)
+            scored = ma.score_memory(fields, fusion["relevance"], query=query,
+                                     scene_boost=scene_boost,
+                                     entity_boost=boost_by_doc.get(r.id, 0.0))
             content_full = fields.get("content", "")
             row = {
                 "id": r.id,
@@ -573,6 +614,7 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
                 "trust_score": round(float(trust), 2),
                 "effective_trust": round(eff_trust, 2),
                 "hit_count": hit_count,
+                "updated_at": updated_at,
                 "deprecated": deprecated,
                 "title": fields.get("title", ""),
                 "content": content_full,
@@ -595,6 +637,32 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
         if dedupe:
             results = ma.dedupe_results(results, threshold=0.88, text_key="content")
 
+        # 时间窗召回 (2026-11-08): 显式 time_filter 优先, 否则自动识别 query 里的
+        # 相对时间表达 (昨天/上周/最近N天...)。后过滤 (zvec Query 无 filter);
+        # 绝对日期不自动识别 (文档标题大量嵌日期会误判, 实测 self MRR -0.15),
+        # 需要时由调用方显式传 time_filter='2026-11-08'。
+        # 窗口内命中 0 条才回退全量并打标 (命中 1-2 条是正确回答, 不饿死也不粉饰)。
+        time_window = None
+        if tr is not None and TIME_ON:
+            try:
+                spec = str(time_filter).strip()
+                if spec:
+                    tw = tr.parse_explicit(spec)
+                else:
+                    tw = tr.parse_time_window(query, absolute=False)
+                if tw:
+                    kept = [r for r in results if tw["start"] <= r.get("updated_at", 0) <= tw["end"]]
+                    if kept:
+                        tw["matched"] = len(kept)
+                        tw["fallback"] = False
+                        results = kept
+                    else:
+                        tw["matched"] = 0
+                        tw["fallback"] = True
+                    time_window = tw
+            except Exception:
+                time_window = None  # 解析/过滤异常绝不影响搜索主路径
+
         top = results[:topk]
         for row in top:
             if level == "L0":
@@ -616,7 +684,65 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
     _record_metric("search_calls", elapsed)
     return {"results": top, "elapsed_ms": elapsed, "total": len(results), "mode": mode,
             "min_trust": min_trust, "scene": _norm_scene(scene) or None, "level": level,
-            "fusion": "rrf" if mode == "hybrid" else mode}
+            "fusion": "rrf" if mode == "hybrid" else mode,
+            "time_window": time_window, "entities": q_entities}
+
+
+@mcp.tool()
+def kb_graph(entity: str, topk: int = 10) -> dict:
+    """实体图谱查询 (2026-11-08): 某实体关联的知识文档 + 共现实体。
+    entity: 实体名, 大小写不敏感 (如 Emby / new-api / zvec / kb_search)。
+    返回: 实体统计 (文档数/类型), 关联文档 (按信任+新鲜度排序, 含标题/摘要),
+    以及经常与该实体同现的其它实体 (related, 用于顺藤摸瓜)。"""
+    if eg is None:
+        return {"error": "entity_graph 模块不可用"}
+    name = str(entity or "").strip().lower()
+    if not name:
+        return {"error": "entity 不能为空"}
+    try:
+        eg.init_db()
+        with eg._lock, eg._conn() as con:
+            row = con.execute(
+                "SELECT display, type, doc_count FROM entities WHERE name=?", (name,)).fetchone()
+        if not row:
+            return {"entity": name, "found": False, "doc_count": 0, "docs": [], "related": []}
+        doc_ids = eg.docs_for(name, limit=300)
+        docs = []
+        try:
+            with _db_lock(10):
+                col = get_collection()
+                fetched = col.fetch(doc_ids, include_vector=False) or {}
+                docs = list(fetched.values())
+        except Exception:
+            docs = []
+        if not docs:  # fetch 不可用 → 回退全量扫描过滤
+            try:
+                with _db_lock(15):
+                    col = get_collection()
+                    want = set(doc_ids)
+                    docs = [d for d in col.iter_docs() if d.id in want]
+            except Exception:
+                docs = []
+        rows = []
+        for d in docs:
+            f = d.fields
+            if int(f.get("deprecated", 0) or 0) >= 1:
+                continue
+            content = f.get("content", "") or ""
+            rows.append({
+                "id": d.id,
+                "title": f.get("title", ""),
+                "snippet": content[:120],
+                "trust_score": round(float(f.get("trust_score", 0) or 0), 2),
+                "updated_at": f.get("updated_at", 0),
+                "kind": ma.kind_name(f.get("kind", 0)) or None,
+            })
+        rows.sort(key=lambda x: (x["trust_score"], x["updated_at"]), reverse=True)
+        return {"entity": name, "display": row[0], "type": row[1], "found": True,
+                "doc_count": row[2], "docs": rows[:topk],
+                "related": eg.related(name)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 
@@ -820,6 +946,13 @@ def kb_add(content: str, category: str = "general", title: str = "", suppress_du
     )
     with _zvec_lock:
         col.insert([doc])
+    # 实体图谱增量关联 (2026-11-08): 新文档抽取实体入库。失败不影响写入本身。
+    if eg is not None:
+        try:
+            eg.init_db()
+            eg.link_doc(doc_id, title, content)
+        except Exception as e:
+            print(f"[MCP-KB] 实体关联失败(不致命): {e}", file=sys.stderr, flush=True)
     # 同步 Obsidian md 镜像
     try:
         _sync_doc_to_md(zvec.Doc(id=doc_id, fields={

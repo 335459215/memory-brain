@@ -21,10 +21,14 @@ Hermes 的 `kb_compact` 会把 MEMORY.md 压成「主题 → `kb搜'…'`」指�
 
 ```
 integrations/hermes/
-├── memory_adapt.py      # 适配核心：RRF / kind / 去重 / 体检 / 保守遗忘
+├── memory_adapt.py      # 适配核心：RRF / kind / 去重 / 体检 / 保守遗忘 / entity_boost
 ├── mcp_server.py        # 已适配的完整 Hermes KB MCP server（可直接替换）
 ├── onnx_embedder.py     # 2026-11-08: onnxruntime fp32 编码器（替代 torch 主路径）
+├── time_recall.py       # 2026-11-08: 时间感知召回（query 时间表达 → 时间窗后过滤）
+├── entity_graph.py      # 2026-11-08: 实体图谱（SQLite 边车库 + idf 加权 boost）
 ├── tools_parity_test.py # 2026-11-08: torch vs ONNX 一致性测试（换编码器前必跑）
+├── tools_build_entities.py # 2026-11-08: 实体图谱全量回填（拷库副本挖掘，不碰活库）
+├── tools_eval_retrieval.py # 2026-11-08: 检索质量评估 harness（real/self/time 三集）
 ├── llm_helper.py        # 语义闸门/概览/精简共用的 LLM 配置读取
 ├── requirements.txt     # server 依赖
 ├── patches/mcp_server.patch
@@ -32,11 +36,15 @@ integrations/hermes/
 └── README.md
 ```
 
-`mcp_server.py` 是 live 版本（2026-11-08，2221 行），包含 `kb_health` / `kb_dedup` / `kb_reindex` 和全部检索改造；如果只想最小改动，用 `patches/mcp_server.patch`。
+`mcp_server.py` 是 live 版本（2026-11-09，约 2320 行），包含 `kb_health` / `kb_dedup` / `kb_reindex` / `kb_graph` 和全部检索改造；如果只想最小改动，用 `patches/mcp_server.patch`。
 
 **2026-11-08 内存优化（两处，均已实测）**：
 1. **编码器 torch→onnxruntime fp32**：顶层不再 import sentence_transformers（无 GPU 的 ARM 机白背 ~800MB libtorch/cublas 栈），改 onnxruntime + 本地模型（`~/hermes-kb/models/model.onnx` 87M fp32 + `tokenizer.json`），RSS 1658→997MB、启动 15s→2s。**qint8 量化版余弦仅 0.974~0.992 与存量 embedding 不兼容，不要用**；换编码器必须先用 `tools_parity_test.py` 验 fp32 余弦 = 1.0000。ONNX 加载失败自动回退 torch CPU（历史故障：optimum 未装+模型缺失曾崩 492 次/天，现在有兜底不会再崩）。
 2. **维护循环补 `col.optimize()`**：此前全代码库只有 `_repair_fts_if_empty` 在 FTS 探测为空时才调，而 FTS 从不空 → 段永不合并（zvec 每次 `add_column` schema 迁移开新段，每段各带一个 RocksDB FTS 实例，11 段时开库 +763MB）。旧段 FTS postings 格式还会让 optimize 报 `not BitPacked` 永久失败，合并修不了只能全库重建（导出→按 schema 内省重建单段新库→同 query 向量 top5 对比一致→换库），RSS 997→404MB。工具留在 `~/hermes-kb/tools_rebuild_db.py`。
+
+**2026-11-08 检索能力补齐（两处，受控 A/B 实测，memory-brain 有而 Hermes KB 没有的能力）**：
+1. **时间感知召回**（`time_recall.py`）：query 含「昨天/上周/最近3天/3天前/上半年」等**相对**时间表达 → 自动开时间窗后过滤（zvec `Query` 无 filter 参数，只能后过滤）。**绝对日期不自动识别**——文档标题大量嵌日期（「用户工作偏好(2026-08-25…)」），自动识别会把文档本身过滤掉（实测 self MRR -0.15）；绝对日期走显式参数 `time_filter='2026-11-08'`。窗口内命中 0 条才回退全量并打标 `time_fallback=true`。评估集 time：hit@1 0.5→0.833、MRR 0.625→0.867，real/self 零影响。
+2. **实体图谱**（`entity_graph.py`）：SQLite 边车库（`entities` + `doc_entities`），拉丁 token 按 canonical 小写归并、df>=3 + 英文停用词挖掘（CJK 无 jieba 不挖），边界用 ASCII 环视而非 `\b`（中英紧贴「emby插件」要切出来）。`kb_graph(entity)` 查关联文档+共现实体；`kb_search` 按 query 实体 **idf 加权**加分（罕见实体强信号）。**平铺加分实测会把时间窗内相邻文档顶上来（time hit@1 -0.17），必须 idf 加权**；`KB_ENTITY_BOOST=0.06` 是最优（self hit@1 +0.2、real 持平、time 无损），0.10 就过头。评估 harness（`tools_eval_retrieval.py`）三集：real 20 条 / self 30 条 / time 6 条，**每跑必须用全新库副本**——`kb_search` 会把 hit_count 写回副本，复用副本会 rich-get-richer 污染后续跑（实测假提升 +0.13）。
 
 ## 安装到 Hermes KB
 
@@ -46,10 +54,15 @@ cp mcp_server.py mcp_server.py.bak-$(date +%Y%m%d_%H%M%S)
 cp /path/to/memory-brain/integrations/hermes/mcp_server.py .
 cp /path/to/memory-brain/integrations/hermes/memory_adapt.py .
 cp /path/to/memory-brain/integrations/hermes/onnx_embedder.py .
+# 时间窗召回 + 实体图谱 (2026-11-08; 缺了 server 自动禁用对应功能, 不会崩):
+cp /path/to/memory-brain/integrations/hermes/time_recall.py .
+cp /path/to/memory-brain/integrations/hermes/entity_graph.py .
 # ONNX 路径需要本地模型 (缺了会自动回退 torch, 但会白背 ~800MB):
 #   models/model.onnx (fp32 87M) + models/tokenizer.json
 systemctl --user restart kb-http.service
-journalctl --user -u kb-http.service | grep -E 'onnxruntime|torch CPU'   # 确认走的主路径
+journalctl --user -u kb-http.service | grep -E 'onnxruntime|torch CPU|time_recall|entity_graph'   # 确认主路径
+# 实体图谱回填 (全量; 必须跑, 否则 kb_graph 空转):
+venv/bin/python3 tools_build_entities.py && systemctl --user restart kb-http.service
 ```
 
 只打最小补丁（2026-11-07 版基线）：

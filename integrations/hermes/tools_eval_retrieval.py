@@ -44,6 +44,17 @@ REAL_QUERIES = [
     ("x86 容器跑在 ARM 上 qemu 内存膨胀", "qemu"),
     ("swap 回收标准动作 swapoff swapon", "swapoff"),
 ]
+# C. 时间窗 query (2026-11-08): (query, 期望子串, 显式 time_filter 或 "")
+#    用 2d/7d 显式窗口锚定会话文档 (11-08 写入) — 不用"今天", 防止跨午夜后
+#    窗口指向空白天导致 fallback (2026-11-09 00:05 实测踩过); 末条走 fallback 路径。
+TIME_QUERIES = [
+    ("zvec 0.8 升级 FTS 消毒 白名单", "白名单", "2d"),
+    ("hermes-kb 内存优化 ONNX 单段重建 optimize", "ONNX fp32", "2d"),
+    ("CDP 泄漏实例占 9222 端口 22小时", "9222", "2d"),
+    ("zvec 段不合并 optimize 内存占用", "三级", "7d"),
+    ("LunaTV 播放页切后台回来不播 root cause", "playerEpoch", "2020-01-01"),
+    ("昨天 zvec FTS 冒号崩溃 消毒", "白名单", ""),
+]
 SELF_N = 30
 SELF_SEED = 20261108
 
@@ -62,13 +73,16 @@ def rank_of(rows, expect):
     return 0
 
 
-def run_set(name, cases):
+def run_set(name, cases, with_time=False):
     hits = {1: 0, 3: 0, 5: 0}
     mrr, lat = [], []
     detail = []
-    for query, expect in cases:
+    for case in cases:
+        query, expect = case[0], case[1]
+        tf = case[2] if with_time and len(case) > 2 else ""
         t0 = time.time()
-        res = kb.kb_search(query, topk=5)
+        res = kb.kb_search(query, topk=5, time_filter=tf) if tf or with_time \
+            else kb.kb_search(query, topk=5)
         lat.append((time.time() - t0) * 1000)
         rows = res["results"]
         r = rank_of(rows, expect)
@@ -76,9 +90,13 @@ def run_set(name, cases):
             if hit_at(rows, expect, k):
                 hits[k] += 1
         mrr.append(1.0 / r if r else 0.0)
+        tw = res.get("time_window")
         detail.append({"query": query, "expect": expect, "rank": r,
+                       "time_window": tw,
                        "top1_title": rows[0]["title"] if rows else ""})
-        print(f"  [{'HIT@1' if r == 1 else f'rank={r}' if r else 'MISS':>7}] {query[:38]:<40} -> {(rows[0]['title'][:34] if rows else '-')}")
+        tws = f" [{tw['label']}{'/fb' if tw['fallback'] else ''}]" if tw else ""
+        print(f"  [{'HIT@1' if r == 1 else f'rank={r}' if r else 'MISS':>7}] "
+              f"{query[:36]:<38}{tws:<16} -> {(rows[0]['title'][:30] if rows else '-')}")
     n = len(cases)
     lat.sort()
     agg = {"set": name, "n": n,
@@ -116,6 +134,12 @@ def prepare_db():
     print(f"[eval] 副本库 {dst} ({sum(os.path.getsize(os.path.join(r,f)) for r,_,fs in os.walk(dst) for f in fs)//1024} KB)")
 
     def cleanup():
+        try:
+            if kb._col is not None:
+                kb._col.close()  # 先关库再删副本, 否则 RocksDB 后台 flush 报一串 IO error
+                kb._col = None
+        except Exception:
+            pass
         shutil.rmtree(tmp, ignore_errors=True)
     return cleanup
 
@@ -128,10 +152,13 @@ def main():
         agg_a, det_a = run_set("real", REAL_QUERIES)
         print("== B. 自指 query (title→本体, 30) ==")
         agg_b, det_b = run_set("self", self_cases())
+        print("== C. 时间窗 query (5) ==")
+        agg_c, det_c = run_set("time", TIME_QUERIES, with_time=True)
     finally:
         cleanup()
     result = {"ts": time.strftime("%F %T"), "real": agg_a, "self": agg_b,
-              "detail_real": det_a, "detail_self": det_b}
+              "time": agg_c, "detail_real": det_a, "detail_self": det_b,
+              "detail_time": det_c}
     if out:
         with open(out, "w") as f:
             json.dump(result, f, ensure_ascii=False, indent=1)

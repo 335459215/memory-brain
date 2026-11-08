@@ -346,6 +346,7 @@ def score_memory(
     query: str = "",
     now: float | None = None,
     scene_boost: float = 0.0,
+    entity_boost: float = 0.0,
 ) -> dict[str, Any]:
     """Return final score plus an explainable breakdown."""
     trust = trust_with_floor(fields.get("trust_score", 1.0), fields.get("updated_at"), now)
@@ -370,6 +371,7 @@ def score_memory(
         + WEIGHTS["hit"] * hit
         + WEIGHTS["kind"] * kind_comp
         + scene_boost
+        + entity_boost
     )
     return {
         "score": round(min(1.0, final), 4),
@@ -381,6 +383,7 @@ def score_memory(
             "kind": kind_name(kind) or None,
             "kind_match": kind_match,
             "scene_boost": round(scene_boost, 3),
+            "entity_boost": round(entity_boost, 3),
         },
     }
 
