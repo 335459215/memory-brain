@@ -135,6 +135,12 @@ def link_doc(doc_id: str, title: str, content: str, min_df_hint=None):
                 " VALUES(?,?,?,0)", (t, forms.get(t, t), _kind_of(forms.get(t, t))))
             con.execute(
                 "INSERT OR IGNORE INTO doc_entities(doc_id, entity) VALUES(?,?)", (doc_id, t))
+            # 即时刷新被触及实体的 doc_count — 否则新增实体计数永远 0, 达不到
+            # df>=3 匹配线, 要等全量重建才生效 (2026-11-09 实测发现)
+            con.execute(
+                "UPDATE entities SET doc_count="
+                "(SELECT COUNT(*) FROM doc_entities WHERE doc_entities.entity=entities.name)"
+                " WHERE name=?", (t,))
     return sorted(toks)
 
 
