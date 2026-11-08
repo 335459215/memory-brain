@@ -26,7 +26,9 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import zvec
 from mcp.server.mcpserver import MCPServer
-from sentence_transformers import SentenceTransformer
+# 注意: sentence_transformers (torch) 不在此处导入 — 2026-11-08 改为 onnxruntime
+# 主路径, torch 仅在 ONNX 加载失败时懒加载兜底 (见 get_onnx_embedder)。
+# 顶层导入 torch 会使无 GPU 的 ARM 机白背 ~800MB (libtorch_cpu/cublas 栈)。
 
 # memory-brain 适配层 (RRF 混合检索 / 记忆类型 / 合并 / 体检 / 保守遗忘)
 import memory_adapt as ma
@@ -77,14 +79,37 @@ TRUST_DEPRECATED_THRESHOLD = 0.3  # 低于此值视为废弃
 TRUST_DEFAULT = 1.0
 
 def get_onnx_embedder():
-    """torch CPU backend — all-MiniLM-L6-v2, 384-dim, 与 kb.py CLI 一致。
+    """all-MiniLM-L6-v2 编码器 — onnxruntime CPU backend, 384 维, mean pooling + L2 归一化。
 
-    注: 原实现用 backend=\"onnx\" + onnx/model_qint8_arm64.onnx, 但本机
-    optimum 未安装且 ONNX 模型文件不存在 → 启动即崩(492次/天崩溃循环)。
-    torch CPU 已缓存模型, 产出相同 384-dim 归一化向量, 搜索兼容。
+    2026-11-08 优化: 从 sentence-transformers(torch) 切到 onnxruntime。
+    本机是无 NVIDIA GPU 的 ARM64 VPS: torch 路径稳态 RSS ~800MB (模型本身仅
+    90M, 其余全是 libtorch_cpu/libtorch_cuda/libcublasLt 栈与分配器 arena),
+    且启动要 15s; onnxruntime + tokenizers 均为 venv 已有依赖, RSS ~200M,
+    加载 0.3s。编码接口对齐 SentenceTransformer.encode (str→(384,), list→(n,384))。
+
+    兼容性 (实测 10 条中英混合/截断/空串边界): fp32 ONNX 与 torch 输出
+    余弦相似度 = 1.0000, 与库内既有 embedding 完全兼容。
+    量化版 model_quantized.onnx 余弦仅 0.974~0.992 (空串 0.9742), 不采用。
+
+    历史: 最初就是 onnx 实现, 因 optimum 未安装 + 模型文件不存在启动即崩
+    (492 次/天崩溃循环), 2026-11-07 改 torch 兜底; 本次直接用 onnxruntime
+    (无需 optimum) + 本地模型 (/root/hermes-kb/models) 解决。torch 仅作
+    ONNX 加载失败时的兜底, 正常不再加载。
     """
     global _onnx_model
-    if _onnx_model is None:
+    if _onnx_model is not None:
+        return _onnx_model
+    try:
+        from onnx_embedder import OnnxEmbedder
+        _model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        _onnx_model = OnnxEmbedder(_model_dir, model_file="model.onnx")
+        _onnx_model.encode("warmup knowledge base search query")  # 图优化+分配器预热
+        print("[MCP-KB] onnxruntime 模型加载完成 (fp32, 较 torch 路径省 ~600MB)",
+              file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[MCP-KB] onnxruntime 加载失败 ({e!r}), 回退 torch CPU 路径",
+              file=sys.stderr, flush=True)
+        from sentence_transformers import SentenceTransformer
         _onnx_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         _onnx_model.encode("warmup knowledge base search query")
         _onnx_model.encode("Docker端口映射规则Emby插件编译")
@@ -2119,6 +2144,21 @@ def _background_maintenance():
                 col = get_collection()
                 deprecated_count = _auto_deprecate(col)
                 cleaned_count = _cleanup_deprecated(col, days=730)
+                # 2026-11-08: 补上从未在维护路径执行过的 zvec optimize (合并段/重建索引)。
+                # 之前只有 _repair_fts_if_empty 在 FTS 探测为空时才调, 而 FTS 从不空 →
+                # 段永不合并: schema 迁移每次 add_column 开新段, 每段各带一个 RocksDB
+                # FTS 实例, 11 个段时仅开库就 +763MB RSS (实测)。旧段 FTS postings
+                # 格式还会让 optimize 报 "source postings is not BitPacked" 合并失败
+                # (已用 tools_rebuild_db.py 重建为单段新库解决)。
+                # optimize 失败不致命 (查询走读路径), 单独 try 保住后续维护步骤。
+                try:
+                    ot0 = time.time()
+                    col.optimize()
+                    print(f"[MCP-KB] optimize 完成 (合并段/重建索引, {time.time()-ot0:.1f}s)",
+                          file=sys.stderr, flush=True)
+                except Exception as oe:
+                    print(f"[MCP-KB] optimize 失败 (不致命, 下个周期重试): {oe}",
+                          file=sys.stderr, flush=True)
                 final_count = col.stats.doc_count
             # 同步 Obsidian md 目录树镜像 (清理孤儿 + 生成README索引)
             try:
