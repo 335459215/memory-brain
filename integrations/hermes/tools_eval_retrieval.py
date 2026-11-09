@@ -144,12 +144,34 @@ def prepare_db():
     return cleanup
 
 
+def coverage_split(cases):
+    """区分「检索质量」与「数据覆盖」: 期望文档不在库里的 query 是覆盖缺口,
+    不是检索失败 (2026-11-09 诊断: real 集 hit@1 0.4 里 8/20 是文档从未入库)。
+    返回 (exists, missing) 两个 case 列表。"""
+    col = kb.get_collection()
+    try:
+        docs = list(col.iter_docs())
+        blobs = [f"{d.fields.get('id', d.id)}|{d.fields.get('title','')}|{d.fields.get('content','')}"
+                 for d in docs]
+        exists = [c for c in cases if any(c[1] in b for b in blobs)]
+        missing = [c for c in cases if not any(c[1] in b for b in blobs)]
+        return exists, missing
+    finally:
+        pass
+
+
 def main():
     out = sys.argv[sys.argv.index("-o") + 1] if "-o" in sys.argv else None
     cleanup = prepare_db()
     try:
-        print("== A. 真实 agent query (20) ==")
-        agg_a, det_a = run_set("real", REAL_QUERIES)
+        real_exists, real_missing = coverage_split(REAL_QUERIES)
+        print(f"== A. 真实 agent query: {len(real_exists)} 篇文档在库 (检索质量样本) "
+              f"/ {len(real_missing)} 篇不在库 (覆盖缺口, 单独列出不进 hit 指标) ==")
+        if real_missing:
+            for q, e in real_missing:
+                print(f"  [覆盖缺口] {e!r} <- {q[:40]}")
+        print("== A. 真实 agent query (仅库内文档) ==")
+        agg_a, det_a = run_set("real", real_exists)
         print("== B. 自指 query (title→本体, 30) ==")
         agg_b, det_b = run_set("self", self_cases())
         print("== C. 时间窗 query (5) ==")
@@ -158,7 +180,9 @@ def main():
         cleanup()
     result = {"ts": time.strftime("%F %T"), "real": agg_a, "self": agg_b,
               "time": agg_c, "detail_real": det_a, "detail_self": det_b,
-              "detail_time": det_c}
+              "detail_time": det_c,
+              "real_coverage": {"in_kb": len(real_exists),
+                                "missing": [e for _, e in real_missing]}}
     if out:
         with open(out, "w") as f:
             json.dump(result, f, ensure_ascii=False, indent=1)

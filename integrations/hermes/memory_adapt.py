@@ -339,6 +339,51 @@ def trust_with_floor(trust: Any, updated_at: Any, now: float | None = None) -> f
     return round(t * (0.5 + 0.5 * decay), 4)
 
 
+_COV_ASCII = re.compile(r"[a-z0-9][a-z0-9_.\-]{1,}")
+_COV_CJK = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def coverage_boost(query: str, docs, boost: float = 0.05) -> dict:
+    """查询词覆盖加分 (2026-11-09): RRF 单腿 rank1 会被双腿中等排名稀释 —
+    实测 FTS rank1 的精确命中文档融合后排 7/55, 输给 6 篇双腿都排 2-10 的
+    topically 相近文档。对 query 稀有 token 在文档中出现的加权求和加分
+    (候选集内逆频: 烂大街词几乎不加分, 精确词强加分), 抵抗 topical swarm。
+    docs: zvec Doc (有 .fields) 或 dict。返回 {doc_id: boost}。"""
+    if boost <= 0 or not docs:
+        return {}
+    import math as _m
+    ids, texts = [], []
+    for d in docs:
+        f = getattr(d, "fields", None)
+        if f is None and isinstance(d, dict):
+            f = d.get("fields") or d
+        f = f or {}
+        ids.append(str(getattr(d, "id", None) or (d.get("id") if isinstance(d, dict) else "")))
+        texts.append(f"{f.get('title', '')} {f.get('content', '')}".lower())
+    q = (query or "").lower()
+    toks = set(_COV_ASCII.findall(q))
+    for run in _COV_CJK.findall(q):
+        if len(run) == 2:
+            toks.add(run)
+        for i in range(len(run) - 1):
+            toks.add(run[i:i + 2])
+    toks.discard("")
+    if not toks:
+        return {}
+    n = len(texts)
+    denom = _m.log(n + 1)
+    out = {}
+    for did, text in zip(ids, texts):
+        s = 0.0
+        for t in toks:
+            if t in text:
+                df = sum(1 for x in texts if t in x)
+                s += _m.log((n + 1) / (df + 1)) / denom  # 0..1, 稀有 token 权重高
+        if s > 0:
+            out[did] = boost * min(1.0, s / 3.0)
+    return out
+
+
 def score_memory(
     fields: dict,
     relevance: float,

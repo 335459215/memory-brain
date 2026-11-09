@@ -52,6 +52,9 @@ except Exception as _e:
 ENTITY_BOOST = float(os.environ.get("KB_ENTITY_BOOST", "0.06"))  # query 命中词典实体的关联文档加分 (与 scene_boost 同量级); KB_ENTITY_BOOST=0 可关 (受控 A/B 用)
 ENTITY_ON = os.environ.get("KB_ENTITY_BOOST", "1") not in ("0", "false", "off")
 TIME_ON = os.environ.get("KB_TIME_FILTER", "1") not in ("0", "false", "off")
+COVERAGE_BOOST = float(os.environ.get("KB_COVERAGE_BOOST", "0.05"))  # 查询词覆盖加分上限 (候选集内逆频加权; 治 RRF 单腿稀释)
+COVERAGE_RRF = float(os.environ.get("KB_COVERAGE_RRF", "0.6"))  # 覆盖分折算到 RRF 原始分的系数 (>0.505 才能翻盘单腿稀释, 实测校准); 0=关
+COVERAGE_ON = os.environ.get("KB_COVERAGE_RRF", "1") not in ("0", "false", "off")
 
 # Obsidian 兼容的 markdown 镜像目录 (kb_export 导出 / kb_add 同步)
 NOTES_ROOT = Path(os.environ.get("KB_NOTES_ROOT", "/root/hermes-kb/notes"))
@@ -557,6 +560,24 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
                             boost_by_doc[did] = w
             except Exception:
                 q_entities, boost_by_doc = [], {}
+
+        # 查询词覆盖加分 (2026-11-09): RRF 单腿 rank1 会被双腿中等排名稀释
+        # (实测 FTS rank1 的 playerEpoch 文档融合掉到 7/55)。稀有 token 覆盖加权,
+        # 施加在 RRF 原始分上再归一化 — 直接加 composite 会被 relevance 权重(0.55)
+        # 压死 (实测 cov 差 0.03 打不动 relevance 差 0.52)。异常时静默跳过。
+        cov_by_doc = {}
+        if COVERAGE_ON and COVERAGE_RRF > 0:
+            try:
+                cov_by_doc = ma.coverage_boost(query, list(doc_by_id.values()), COVERAGE_BOOST)
+                if cov_by_doc:
+                    raw = {d: f["rrf"] + cov_by_doc.get(d, 0.0) * COVERAGE_RRF
+                           for d, f in fused.items()}
+                    lo, hi = min(raw.values()), max(raw.values())
+                    span = (hi - lo) or 1.0
+                    for d, f in fused.items():
+                        f["relevance"] = (raw[d] - lo) / span
+            except Exception:
+                cov_by_doc = {}
 
         results = []
         for doc_id, fusion in fused.items():
