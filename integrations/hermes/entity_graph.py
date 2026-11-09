@@ -26,6 +26,35 @@ _TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+(?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]{2,}(?![A-Za-z0-9])")
 
+# CJK 实体挖掘 (2026-11-09): 中文无词边界, 收连续 CJK 串的所有 bigram (长词被
+# 切成片面, 靠 df 门槛 + idf 加权兜底); 含功能字的 bigram 一律不收 (的地得吗呢…
+# 跨文档高频但零区分度)。Latin token 与 CJK bigram 走同一条 df/idf 管线。
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+_CJK_FUNC = set("的了着过是在有和与及或也都还很太之于以为被把将从到向由其此该各每某我你他她它们个上下中内外前后间时分会能要想做用来说看给让使成为以至但却而且因故若虽即便再又才正已曾未将须需应得吗呢吧啊哦么这那什么怎么如并就等包按据包括凭待公具典编综维网")
+_CJK_MIN_DF = 3  # 与拉丁 token 同门槛
+ENTITY_CJK = os.environ.get("KB_ENTITY_CJK", "1") not in ("0", "false", "off")  # CJK bigram 实体开关 (A/B 用; 词典始终全量建, 查询侧过滤)
+
+
+def _cjk_bigrams(text: str) -> set:
+    """文本中所有 CJK bigram (去功能字组合)。"""
+    out = set()
+    for run in _CJK_RUN_RE.findall(text or ""):
+        if len(run) == 2:
+            pair = run
+            if pair[0] not in _CJK_FUNC and pair[1] not in _CJK_FUNC:
+                out.add(pair)
+            continue
+        for i in range(len(run) - 1):
+            pair = run[i:i + 2]
+            if pair[0] in _CJK_FUNC or pair[1] in _CJK_FUNC:
+                continue
+            out.add(pair)
+    return out
+
+
+def _is_cjk(s: str) -> bool:
+    return bool(s) and all("\u4e00" <= c <= "\u9fff" for c in s)
+
 # 英文功能词 + 泛技术词 (df 高但无区分度)。MCP/LLM/VPS/CDP/CDN/PWA/CF 等本栈
 # 专有词不停 — 它们是有效实体。
 _STOP = set("""
@@ -87,8 +116,9 @@ def init_db():
         con.execute("CREATE INDEX IF NOT EXISTS idx_de_entity ON doc_entities(entity)")
 
 
-def tokenize(text: str):
-    """文本 → canonical token 集合 (小写, 去停用词, 去纯数字)。"""
+def tokenize(text: str, cjk: bool = None):
+    """文本 → canonical token 集合 (小写, 去停用词, 去纯数字)。
+    cjk: 是否含 CJK bigram 实体 (2026-11-09; 默认读 KB_ENTITY_CJK, A/B 用)。"""
     if not text:
         return set()
     out = set()
@@ -98,6 +128,10 @@ def tokenize(text: str):
         if low in _STOP or len(low) < 3 or low.isdigit():
             continue
         out.add(low)
+    if cjk is None:
+        cjk = ENTITY_CJK
+    if cjk:
+        out |= _cjk_bigrams(str(text))
     return out
 
 
