@@ -56,6 +56,8 @@ COVERAGE_BOOST = float(os.environ.get("KB_COVERAGE_BOOST", "0.05"))  # 查询词
 COVERAGE_RRF = float(os.environ.get("KB_COVERAGE_RRF", "0.6"))  # 覆盖分折算到 RRF 原始分的系数 (>0.505 才能翻盘单腿稀释, 实测校准); 0=关
 COVERAGE_ON = os.environ.get("KB_COVERAGE_RRF", "1") not in ("0", "false", "off")
 SCENE_AUTO = os.environ.get("KB_SCENE_AUTO", "0") not in ("0", "false", "off")  # query 自动识别 scene (窄信号); 默认关, A/B 验证后再定
+SCENE_SOFT = os.environ.get("KB_SCENE_SOFT", "0") not in ("0", "false", "off")  # 软降级: 自动识别时异场景降权不跳过 (KB_SCENE_AUTO=1 才生效)
+SCENE_SOFT_DEMOTE = float(os.environ.get("KB_SCENE_SOFT_DEMOTE", "-0.05"))  # 异场景降权幅度
 GATE_LLM_TIMEOUT = float(os.environ.get("KB_GATE_TIMEOUT", "15"))  # 语义闸门 LLM 超时(s); best-effort 调用, 15s 失败即放行 (45s 会吃掉 MCP 客户端 60s 预算)
 
 # Obsidian 兼容的 markdown 镜像目录 (kb_export 导出 / kb_add 同步)
@@ -571,6 +573,7 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
         # 默认关 (KB_SCENE_AUTO=1 开), 与显式传参走同一套软过滤逻辑。
         eff_scene = scene
         scene_auto = ""
+        scene_soft = SCENE_SOFT
         if not eff_scene and SCENE_AUTO:
             try:
                 scene_auto = ma.detect_scene(query)
@@ -673,10 +676,18 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
             scene_boost = 0.0
             if eff_scene and _norm_scene(eff_scene):
                 if entry_scene and entry_scene != _norm_scene(eff_scene):
-                    continue
+                    # 2026-11-09: 软降级模式 (KB_SCENE_SOFT=1) — 仅对 query 自动
+                    # 识别的场景生效: 异场景不跳过只降权。硬跳过在显式传参时是
+                    # 纯净分流(调用方知道自己要什么); 但自动识别有误判率, 硬跳过
+                    # 会把期望文档直接滤掉 (A/B 实测 hit@5 1.0→0.85), 降权把
+                    # 误判代价从"丢失"降为"下沉", 赌信号正确时的排序收益。
+                    if scene_soft and scene_auto:
+                        scene_boost = SCENE_SOFT_DEMOTE
+                    else:
+                        continue
                 if not entry_scene:
                     scene_fallback = True
-                else:
+                elif scene_boost == 0.0:
                     scene_boost = 0.05
 
             scored = ma.score_memory(fields, fusion["relevance"], query=query,
