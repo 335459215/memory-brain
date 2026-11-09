@@ -428,6 +428,45 @@ def _cleanup_deprecated(col, days: int = 730) -> int:
     return len(to_delete)
 
 
+def _dedupe_pass(col, dry_run: bool = False) -> dict:
+    """同内容去重清扫 (自愈): 每组保留信息量最大一篇, 其余废弃(搜索不可见, 可逆)。
+
+    分组键 (一篇只进一组):
+    1. 指针快照 (← 开头或 is_pointer_doc) → 按归一化标题分组。
+       kb_compact 修复前(10-24)的历史产物: 同题指针快照 28+31 篇, 内容各不同
+       (不能按内容合), 但同题=同一导航快照, 留最长(路由行最多)。
+    2. 其余 → content_fingerprint (标点/空白归一, 严于 md5: 同指纹 ⊃ 同哈希)。
+       kb_add 去重本应拦下同内容; 超时重试竞态会漏 (2026-11-09 实测 scene
+       经验文档同哈希双入库, 相隔 6s; 隔离复测双写正常=竞态非常态)。
+    保留规则: content 最长者 (并列取 id 最大=最新)。
+    """
+    docs = [r for r in _iter_all_docs(col) if int(r.fields.get("deprecated", 0) or 0) < 1]
+    groups: dict = {}
+    for r in docs:
+        f = r.fields
+        title = str(f.get("title") or "")
+        if title.lstrip().startswith("←") or ma.is_pointer_doc(f):
+            nt = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", title.lower())
+            if nt:
+                groups.setdefault(("ptr", nt), []).append(r)
+                continue
+        fp = ma.content_fingerprint(f.get("content", ""))
+        if fp:
+            groups.setdefault(("fp", fp), []).append(r)
+    to_deprecate = []
+    for key, g in groups.items():
+        if len(g) < 2:
+            continue
+        g.sort(key=lambda r: (len(str(r.fields.get("content", ""))), r.id))
+        to_deprecate.extend(r.id for r in g[:-1])  # 留最后一篇(最长, 并列最新)
+    if to_deprecate and not dry_run:
+        now = int(time.time())
+        col.update([zvec.Doc(id=i, fields={"deprecated": 1, "updated_at": now}) for i in to_deprecate])
+    return {"scanned": len(docs), "groups": len(groups),
+            "duplicate_groups": sum(1 for g in groups.values() if len(g) > 1),
+            "deprecated": len(to_deprecate), "ids": to_deprecate, "dry_run": dry_run}
+
+
 # === Obsidian 兼容 markdown 镜像 (目录树) ===
 
 def _safe_filename(title: str) -> str:
@@ -549,6 +588,10 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
             if fts_q:
                 fts_raw = list(col.query(
                     zvec.Query("content", fts=zvec.Fts(query_string=fts_q)), topk=candidate_k))
+        # 2026-11-09 实测否决: 候选阶段预滤已废弃条目。后过滤(结果循环里
+        # deprecated>=1 跳过)本就能正确输出 topk 活文档 — 废弃文档不占输出槽位。
+        # 预滤会改变两条腿的排名 → RRF 融合次序漂移, 实测 real hit@5 1.0→0.95
+        # (一篇期望文档被挤出去), self/time 平。死文档对融合的影响是二阶效应, 不动。
 
         # RRF: 只融合排名, 不混用量纲不同的余弦分与 BM25 分 (memory-brain DESIGN §4)
         fused = ma.rrf_fuse(vec_raw, fts_raw)
@@ -1514,6 +1557,9 @@ def kb_optimize(deprecate_days: int = 365, cleanup_days: int = 730,
         col = get_collection()
         deprecated_count = _auto_deprecate(col, stale_days=deprecate_days)
         cleaned_count = _cleanup_deprecated(col, days=cleanup_days)
+        # 确定性同内容清扫 (零风险, 默认开): 同指纹组 + 指针快照同题组,
+        # 每组留最长其余废弃。语义版合并(dedupe=true)风险高, 仍默认关。
+        exact = _dedupe_pass(col)
         if dedupe:
             docs = _load_views(col)
             clusters = ma.duplicate_clusters(docs, threshold=dedupe_threshold, same_category=True)
@@ -1534,6 +1580,8 @@ def kb_optimize(deprecate_days: int = 365, cleanup_days: int = 730,
     return {
         "auto_deprecated": deprecated_count,
         "cleaned": cleaned_count,
+        "exact_dedupe": {"duplicate_groups": exact["duplicate_groups"],
+                         "deprecated": exact["deprecated"]},
         "dedupe": dedupe_result,
         "final_doc_count": final_count,
         "deprecate_threshold_days": deprecate_days,
@@ -2360,6 +2408,10 @@ def _background_maintenance():
                 col = get_collection()
                 deprecated_count = _auto_deprecate(col)
                 cleaned_count = _cleanup_deprecated(col, days=730)
+                # 2026-11-09: 确定性同内容清扫 (同指纹+指针快照同题)。kb_add 的
+                # hash 去重拦得住绝大多数, 但超时重试竞态会漏 (实测同哈希双入库),
+                # 这里每拍自愈。先废弃再 optimize, 让段合并时一起 compact。
+                dedup = _dedupe_pass(col)
                 # 2026-11-08: 补上从未在维护路径执行过的 zvec optimize (合并段/重建索引)。
                 # 之前只有 _repair_fts_if_empty 在 FTS 探测为空时才调, 而 FTS 从不空 →
                 # 段永不合并: schema 迁移每次 add_column 开新段, 每段各带一个 RocksDB
@@ -2400,7 +2452,9 @@ def _background_maintenance():
             except Exception as e:
                 print(f"[MCP-KB] 记忆文件精简失败: {e}", file=sys.stderr, flush=True)
             elapsed = round((time.time() - t0) * 1000)
-            print(f"[MCP-KB] 后台维护: 废弃{deprecated_count}条, 清理{cleaned_count}条, 剩余{final_count}条 ({elapsed}ms)", file=sys.stderr, flush=True)
+            print(f"[MCP-KB] 后台维护: 废弃{deprecated_count}条, 清理{cleaned_count}条, "
+                  f"去重{dedup['deprecated']}条({dedup['duplicate_groups']}组), "
+                  f"剩余{final_count}条 ({elapsed}ms)", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"[MCP-KB] 后台维护出错: {e}", file=sys.stderr, flush=True)
         
