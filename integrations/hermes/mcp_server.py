@@ -56,6 +56,7 @@ COVERAGE_BOOST = float(os.environ.get("KB_COVERAGE_BOOST", "0.05"))  # 查询词
 COVERAGE_RRF = float(os.environ.get("KB_COVERAGE_RRF", "0.6"))  # 覆盖分折算到 RRF 原始分的系数 (>0.505 才能翻盘单腿稀释, 实测校准); 0=关
 COVERAGE_ON = os.environ.get("KB_COVERAGE_RRF", "1") not in ("0", "false", "off")
 SCENE_AUTO = os.environ.get("KB_SCENE_AUTO", "0") not in ("0", "false", "off")  # query 自动识别 scene (窄信号); 默认关, A/B 验证后再定
+GATE_LLM_TIMEOUT = float(os.environ.get("KB_GATE_TIMEOUT", "15"))  # 语义闸门 LLM 超时(s); best-effort 调用, 15s 失败即放行 (45s 会吃掉 MCP 客户端 60s 预算)
 
 # Obsidian 兼容的 markdown 镜像目录 (kb_export 导出 / kb_add 同步)
 NOTES_ROOT = Path(os.environ.get("KB_NOTES_ROOT", "/root/hermes-kb/notes"))
@@ -801,7 +802,8 @@ def _semantic_gate_judge(new_content: str, candidates: list):
             "不确定时判 complement。不要寒暄, 不要输出 JSON 之外内容。"
         )
         user = f"新内容:\n{new_content[:500]}\n\n库内候选:\n{cands_text}"
-        raw = llm_summarize(system, user, max_tokens=4096, temperature=0.1)
+        raw = llm_summarize(system, user, max_tokens=4096, temperature=0.1,
+                            timeout=GATE_LLM_TIMEOUT)
         if not raw:
             return None
         import re, json as _json

@@ -87,7 +87,7 @@ def get_model_config() -> dict:
 
 
 def llm_summarize(system_prompt: str, user_prompt: str, max_tokens: int = 8192,
-                  temperature: float = 0.3) -> str | None:
+                  temperature: float = 0.3, timeout: float = 45) -> str | None:
     """Call the Hermes-configured LLM (OpenAI-compatible) to summarize/compact text.
     Automatically uses whatever model the user has configured in config.yaml.
     Returns the LLM's text response, or None on failure.
@@ -119,7 +119,9 @@ def llm_summarize(system_prompt: str, user_prompt: str, max_tokens: int = 8192,
 
     try:
         # 2026-10-16: 120s → 45s，必须小于 MCP 客户端工具超时(60s)，否则手动 kb_compact 必超时
-        with httpx.Client(timeout=45) as client:
+        # 2026-11-09: timeout 参数化 — 语义闸门这类 best-effort 调用传 15s 快速失败放行
+        # (闸门挂了有 03:30 kb_conflicts cron 兜底, 不该吃掉写入预算的大半)
+        with httpx.Client(timeout=timeout) as client:
             resp = client.post(
                 f"{cfg['base_url']}/chat/completions",
                 headers=headers,
