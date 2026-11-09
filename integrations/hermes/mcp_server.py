@@ -55,6 +55,7 @@ TIME_ON = os.environ.get("KB_TIME_FILTER", "1") not in ("0", "false", "off")
 COVERAGE_BOOST = float(os.environ.get("KB_COVERAGE_BOOST", "0.05"))  # 查询词覆盖加分上限 (候选集内逆频加权; 治 RRF 单腿稀释)
 COVERAGE_RRF = float(os.environ.get("KB_COVERAGE_RRF", "0.6"))  # 覆盖分折算到 RRF 原始分的系数 (>0.505 才能翻盘单腿稀释, 实测校准); 0=关
 COVERAGE_ON = os.environ.get("KB_COVERAGE_RRF", "1") not in ("0", "false", "off")
+SCENE_AUTO = os.environ.get("KB_SCENE_AUTO", "0") not in ("0", "false", "off")  # query 自动识别 scene (窄信号); 默认关, A/B 验证后再定
 
 # Obsidian 兼容的 markdown 镜像目录 (kb_export 导出 / kb_add 同步)
 NOTES_ROOT = Path(os.environ.get("KB_NOTES_ROOT", "/root/hermes-kb/notes"))
@@ -526,6 +527,16 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
     t0 = time.time()
     with _db_lock(15):  # 2026-10-24: 读工具带超时, 锁忙快速报错不挂死
         col = get_collection()
+        # scene 自动识别 (2026-11-09): 调用方没传 scene 时从 query 窄信号推断;
+        # 默认关 (KB_SCENE_AUTO=1 开), 与显式传参走同一套软过滤逻辑。
+        eff_scene = scene
+        scene_auto = ""
+        if not eff_scene and SCENE_AUTO:
+            try:
+                scene_auto = ma.detect_scene(query)
+            except Exception:
+                scene_auto = ""
+            eff_scene = scene_auto
         candidate_k = max(30, min(120, topk * 6))
 
         vec_raw, fts_raw = [], []
@@ -616,8 +627,8 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
             entry_scene = _read_scene_field(fields)
             scene_fallback = False
             scene_boost = 0.0
-            if scene and _norm_scene(scene):
-                if entry_scene and entry_scene != _norm_scene(scene):
+            if eff_scene and _norm_scene(eff_scene):
+                if entry_scene and entry_scene != _norm_scene(eff_scene):
                     continue
                 if not entry_scene:
                     scene_fallback = True
@@ -705,6 +716,7 @@ def kb_search(query: str, mode: str = "hybrid", topk: int = 5, min_trust: float 
     _record_metric("search_calls", elapsed)
     return {"results": top, "elapsed_ms": elapsed, "total": len(results), "mode": mode,
             "min_trust": min_trust, "scene": _norm_scene(scene) or None, "level": level,
+            "scene_auto": scene_auto or None,
             "fusion": "rrf" if mode == "hybrid" else mode,
             "time_window": time_window, "entities": q_entities}
 
@@ -1450,6 +1462,40 @@ def kb_reindex(limit: int = 5000, force: bool = False) -> dict:
     elapsed = round((time.time() - t0) * 1000)
     _record_metric("reindex_calls", elapsed)
     return {"updated": len(updates), "kinds": counts, "elapsed_ms": elapsed}
+
+
+@mcp.tool()
+def kb_rescene(dry_run: bool = True, limit: int = 5000, force: bool = False) -> dict:
+    """回填 scene 字段 (2026-11-09): 按 category/title/content 规则推断 chat/working/coding。
+    窄判定, 拿不准的返回空=留未打标(兜底保留, 不会被异场景过滤跳过)。
+    设计意图 (2026-10-23 KB 升级): 生产力任务=working, 代码/技术决策=coding, 偏好/闲聊=chat。
+
+    dry_run: true(默认) 只统计不写; false 才落库。
+    limit: 单次最多处理条数(默认5000)。幂等, 可重复运行。
+    force: true 时对所有条目重新推断(规则升级后修正旧标签用); 默认只处理 scene=0 的。"""
+    t0 = time.time()
+    with _db_lock(120):
+        col = get_collection()
+        docs = list(_iter_all_docs(col))
+        updates, counts = [], {}
+        for r in docs[:max(1, int(limit))]:
+            cur = _read_scene_field(r.fields)
+            if not force and cur:
+                continue
+            sc = ma.infer_scene(r.fields.get("category", ""), r.fields.get("title", ""),
+                                r.fields.get("content", ""))
+            if not sc or sc == cur:
+                continue
+            updates.append((r.id, sc))
+            counts[sc] = counts.get(sc, 0) + 1
+        if updates and not dry_run:
+            _batch_update(col, [zvec.Doc(id=i, fields={"scene": _scene_code(s)})
+                                for i, s in updates])
+    elapsed = round((time.time() - t0) * 1000)
+    _record_metric("rescene_calls", elapsed)
+    return {"dry_run": dry_run, "would_update": len(updates) if dry_run else None,
+            "updated": None if dry_run else len(updates),
+            "scenes": counts, "elapsed_ms": elapsed}
 
 
 @mcp.tool()

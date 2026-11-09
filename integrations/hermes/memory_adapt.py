@@ -77,6 +77,74 @@ def kind_code(kind: Any) -> int:
     return KIND_CODES.get(str(kind or "").strip().lower(), KIND_UNSPECIFIED)
 
 
+VALID_SCENE_INFER_HINTS = (
+    # coding 信号 (标题级, 窄判定)
+    (".py", ".ts", ".go", ".cs", ".cpp", "插件", "commit", "pull request", "api ",
+     "重构", "编译", "前端", "后端", "代码", "函数", "报错", "堆栈", "单测"),
+    # working 信号 (标题级)
+    ("部署", "容器", "服务器", "vps", "docker", "内存", "磁盘", "日志", "备份",
+     "运维", "监控", "迁移", "回收", "归因"),
+)
+
+
+_SCENE_QUERY_CODING = (
+    ".py", ".ts", ".go", ".cs", ".cpp", ".js", "插件", "commit", "pull request",
+    "代码", "重构", "编译", "函数", "api ", "前端", "后端", "报错", "堆栈", "单测",
+)
+_SCENE_QUERY_WORKING = (
+    "服务器", "vps", "docker", "容器", "内存", "磁盘", "日志", "备份", "运维",
+    "监控", "迁移", "回收", "归因", "swap", "tmpfs", "binlog", "cgroup", "部署",
+)
+_SCENE_QUERY_CHAT = ("偏好", "喜欢", "讨厌", "习惯", "原话", "口味", "风格")
+
+
+def detect_scene(query: str) -> str:
+    """从 query 推断场景 (2026-11-09): 窄信号, 无信号返回 "" (=不过滤)。
+    与 infer_scene(文档侧) 同源信号; 冲突时 coding 优先 (代码信号最specific)。
+    注意: 自动识别只做软暗示, 调用方显式传 scene 才是硬过滤。"""
+    q = str(query or "").lower()
+    if any(w in q for w in _SCENE_QUERY_CODING):
+        return "coding"
+    if any(w in q for w in _SCENE_QUERY_WORKING):
+        return "working"
+    if any(w in q for w in _SCENE_QUERY_CHAT):
+        return "chat"
+    return ""
+
+
+def infer_scene(category: str = "", title: str = "", content: str = "") -> str:
+    """推断 scene (chat/working/coding); 确定性规则, 窄判定, 拿不准返回 ""
+    (=未打标, 走兜底保留, 绝不错标进异场景被跳过)。
+
+    设计意图 (2026-10-23 KB 升级): 生产力任务=working, 代码修复/技术决策=coding,
+    偏好/闲聊=chat。已打标条目不覆盖 (除非 force)。
+    """
+    cat = str(category or "").strip().lower()
+    title_l = str(title or "").strip().lower()
+    head = str(content or "")[:200].lower()
+
+    # 偏好/画像 → chat
+    if cat in ("user", "profile"):
+        return "chat"
+    if any(w in title_l for w in ("偏好", "原话", "习惯", "画像", "口味")):
+        return "chat"
+    # 代码/技术决策 → coding
+    if cat == "development":
+        return "coding"
+    if any(w in title_l for w in VALID_SCENE_INFER_HINTS[0]):
+        return "coding"
+    # 运维/基础设施/任务事实 → working
+    if cat in ("infrastructure", "memory", "services"):
+        return "working"
+    if any(w in title_l for w in VALID_SCENE_INFER_HINTS[1]):
+        return "working"
+    if any(w in head[:120] for w in (
+        "部署", "容器", "服务器", "vps", "docker", "内存", "磁盘", "日志", "备份", "运维",
+    )):
+        return "working"
+    return ""
+
+
 def infer_kind(category: str = "", title: str = "", content: str = "",
                scene: str = "") -> int:
     """Infer a memory kind from metadata.  Deterministic, no model call.
