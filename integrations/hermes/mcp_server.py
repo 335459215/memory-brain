@@ -1344,6 +1344,11 @@ def kb_stats() -> dict:
         scene_counts = {"chat": 0, "working": 0, "coding": 0, "unlabeled": 0}
         kind_counts = {}
         pointer_count = 0
+        stale_candidates = []   # 高信任+60天未更新+零命中 = 沉寂知识(从未被用)
+        stale_count = 0
+        never_hit = 0           # 从未被检索命中
+        now_ts = int(time.time())
+        stale_cutoff = now_ts - 60 * 86400
         
         for r in all_docs:
             trust = r.fields.get("trust_score", TRUST_DEFAULT)
@@ -1370,6 +1375,19 @@ def kb_stats() -> dict:
             kind_counts[kn] = kind_counts.get(kn, 0) + 1
             if dep < 1 and ma.is_pointer_doc(r.fields):
                 pointer_count += 1
+            if dep < 1:
+                try: hits = int(r.fields.get("hit_count", 0) or 0)
+                except (TypeError, ValueError): hits = 0
+                if hits == 0:
+                    never_hit += 1
+                try: upd = int(r.fields.get("updated_at", 0) or 0)
+                except (TypeError, ValueError): upd = 0
+                if hits == 0 and upd and upd < stale_cutoff and trust >= 0.7:
+                    stale_count += 1
+                    if len(stale_candidates) < 40:
+                        stale_candidates.append({
+                            "id": r.id, "title": str(r.fields.get("title", ""))[:50],
+                            "days_old": (now_ts - upd) // 86400})
     
     elapsed = round((time.time() - t0) * 1000)
     
@@ -1385,6 +1403,9 @@ def kb_stats() -> dict:
         "scene_distribution": scene_counts,
         "kind_distribution": kind_counts,
         "pointer_artifacts": pointer_count,
+        "stale_candidates": stale_candidates,
+        "stale_count": stale_count,
+        "never_hit": never_hit,
         "metrics": metrics_copy,
     }
 
