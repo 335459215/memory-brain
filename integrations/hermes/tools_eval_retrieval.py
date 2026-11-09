@@ -110,7 +110,11 @@ def run_set(name, cases, with_time=False):
 
 def self_cases():
     col = kb.get_collection()
-    docs = list(col.iter_docs())
+    # 2026-11-09: 按 id 排序后再采样 — id 是 kb_<毫秒时间戳>_<hash> 时序有序,
+    # 新文档追加在尾部。固定种子对已排序列表采样: 老文档位置不变 → 语料增长时
+    # 样本基本稳定(只渐进换血), 跨次评估才可比。(不排序时 sample() 在增长的
+    # 列表上换出整批题, self 0.80→0.667 纯采样漂移, 曾误判为回归)
+    docs = sorted(col.iter_docs(), key=lambda d: d.id)
     rng = random.Random(SELF_SEED)
     sample = rng.sample(docs, min(SELF_N, len(docs)))
     return [(d.fields.get("title", "")[:60], d.id) for d in sample if d.fields.get("title")]
