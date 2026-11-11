@@ -9,8 +9,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { createAdapter, getAdapter } from './xiaojiu-brain.mjs';
-import { createRequestBridge } from './request-bridge.mjs';
+import { createRequestBridge, createNativeRequestBudgetBridge } from './request-bridge.mjs';
+import { createRequestBudget } from './request-budget.mjs';
+import { createContextSettings, CONTEXT_DEFAULTS } from './context-settings.mjs';
+import { createCompactionSupport } from './compaction-support.mjs';
 import { probeRuntime } from './host-compat.mjs';
+import { discoverHostRuntime } from './runtime-discovery.mjs';
 import { createRuntimeManager, resolveRuntimeHome } from './runtime-home.mjs';
 import { createOnboarding, mountOnboarding } from './onboarding.mjs';
 
@@ -20,28 +24,15 @@ export { getAdapter };
 const execute = promisify(execFile);
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const onboarding = new WeakMap();
+const CONTEXT_FIELDS=Object.keys(CONTEXT_DEFAULTS);
+function contextSettings(configFile,config){
+  return createContextSettings({file:path.join(path.dirname(configFile),'context-management.json'),
+    defaults:Object.fromEntries(CONTEXT_FIELDS.filter(key=>config[key]!==undefined).map(key=>[key,config[key]]))});
+}
 export const getOnboarding = ctx => onboarding.get(ctx);
 
 export function discoverRuntime({allowUnverified=false}={}) {
-  const inspect=allowUnverified?probeRuntime:inspectRuntime;
-  if (process.env.XIAOJIU_DSH_RUNTIME) return inspect(path.resolve(process.env.XIAOJIU_DSH_RUNTIME));
-  const anchors = [process.argv[1], fileURLToPath(import.meta.url), path.join(process.cwd(), 'package.json')];
-  for (const anchor of anchors) {
-    if (!anchor || !path.isAbsolute(anchor)) continue;
-    let loop;
-    try { loop = createRequire(anchor).resolve('@deepseek-ai/dsh-agent-loop'); } catch { continue; }
-    // Resolve only from the host's own module search scope; never scan disks or
-    // silently download a second copy of the DSH runtime.
-    const candidate = path.resolve(path.dirname(loop), '../../../..');
-    if (fs.existsSync(path.join(candidate, 'node_modules/@deepseek-ai/dsh-session/lib/index.js'))) return inspect(candidate);
-  }
-  if(allowUnverified){
-    const value=probeRuntime(path.resolve(process.cwd()));
-    value.supported=false;value.injectionMode='diagnostic_only';
-    value.compatibility={...value.compatibility,supported:false,mode:'diagnostic_only',reason:'dsh_runtime_not_resolved'};
-    return value;
-  }
-  throw new Error('dsh_runtime_not_resolved_use_the_connection_launcher');
+  return discoverHostRuntime({allowUnverified,probeRuntime,inspectRuntime,pluginUrl:import.meta.url});
 }
 
 export function inspectRuntime(runtimePath) {
@@ -53,6 +44,8 @@ export function inspectRuntime(runtimePath) {
 export function resolveConfiguration(config = {}) {
   if (config.enabled !== true) return { enabled: false };
   if (config.requestBridge !== undefined) throw new Error('request_bridge_is_owned_by_the_verified_public_entry');
+  if (config.requestBudget !== undefined) throw new Error('request_budget_is_owned_by_the_verified_public_entry');
+  if (config.compactionSupport !== undefined) throw new Error('compaction_support_is_owned_by_the_verified_public_entry');
   if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('node_22_or_later_required');
   if (config.token !== undefined || config.baseUrl !== undefined) throw new Error('use_local_brain_config_instead_of_inline_token_or_url');
   const configFile = path.resolve(config.brainConfigFile || path.join(packageRoot, 'private', 'config.json'));
@@ -63,7 +56,8 @@ export function resolveConfiguration(config = {}) {
   const data = path.resolve(path.dirname(configFile), local.data_dir || './data');
   const namespace = config.queueNamespace || 'default';
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(namespace)) throw new Error('queue_namespace_invalid');
-  const options = { ...config, ...runtime, configFile, packageRoot,
+  const contextPolicy=contextSettings(configFile,config),policy=contextPolicy.read();
+  const options = { ...config, ...policy, ...runtime, configFile, packageRoot, contextPolicySignature:contextPolicy.signature(policy),
     baseUrl: `http://${local.host === '::1' ? '[::1]' : local.host}:${local.port}`, token: local.api_token,
     queueDir: path.join(data, 'dsh-queue', namespace) };
   delete options.runtime;
@@ -72,7 +66,9 @@ export function resolveConfiguration(config = {}) {
 
 async function ready(options) {
   try {
-    const response = await fetch(options.baseUrl + '/v1/status', { redirect: 'error', signal: AbortSignal.timeout(1500),
+    const configured = Number(options.readinessTimeoutMs ?? 1500);
+    const readinessTimeoutMs = Number.isFinite(configured) ? Math.max(500, Math.min(30000, Math.floor(configured))) : 1500;
+    const response = await fetch(options.baseUrl + '/v1/status', { redirect: 'error', signal: AbortSignal.timeout(readinessTimeoutMs),
       headers: { Authorization: `Bearer ${options.token}` } });
     const value = await response.json();
     return response.ok && value.ok === true && typeof value.data?.version === 'string' && typeof value.data?.build_id === 'string';
@@ -82,20 +78,41 @@ async function ready(options) {
 async function attach(ctx,options,ensureReady,isDisposed) {
   // The legacy bridge is per-agent, version/fingerprint gated and process local.
   // It never edits the host bundle, prototype or durable message history.
+  const budget=createRequestBudget({enabled:options.contextEnabled!==false,maxInputTokens:options.contextMaxInputTokens,
+    safetyTokens:options.contextSafetyTokens,onWarning:code=>ctx.logger?.warn?.('memory-brain: '+String(code).replace(/[^a-zA-Z0-9_:.-]/g,''))});
+  options.requestBudget=budget;
+  const llm=await import(options.llmModule);
   const bridge = options.injectionMode === 'scoped_agent_bridge' ?
-    createRequestBridge({ llm: await import(options.llmModule),sourceSha256:options.compatibility.loop_canonical_sha256 }) : null;
+    createRequestBridge({llm,sourceSha256:options.compatibility.loop_canonical_sha256,requestBudget:budget}) :
+    options.injectionMode==='native_snapshot'&&options.contextEnabled!==false?
+      createNativeRequestBudgetBridge({llm,sourceSha256:options.compatibility.loop_sha256,requestBudget:budget}):null;
   if (bridge) options.requestBridge = bridge;
+  let support;
   try {
   if (!await ready(options)) await ensureReady();
   if (isDisposed()) throw new Error('setup_closed');
   if (!await ready(options)) throw new Error('memory_brain_readiness_not_confirmed');
+  support = createCompactionSupport({ ctx, enabled: options.contextEnabled !== false,
+    summaryEnabled: options.contextSummaryEnabled, summaryMaxChars: options.contextSummaryMaxChars,
+    summaryMaxTokens: options.contextSummaryMaxTokens, pressureCooldownMs: options.contextPressureCooldownMs,
+    pressureThresholdRatio: options.contextPressureThresholdRatio, pressureRetainRatio: options.contextPressureRetainRatio,
+    pressureHeadroomTokens: options.contextPressureHeadroomTokens,
+    toolPruneEnabled: options.contextToolPruneEnabled, toolPruneThresholdChars: options.contextToolPruneThresholdChars,
+    toolPruneHeadChars: options.contextToolPruneHeadChars, toolPruneTailChars: options.contextToolPruneTailChars,
+    basicCompactionModule: options.basicCompactionModule, llmModule: options.llmModule,
+    cordisModule: options.cordisModule, toolResultPrunerModule: options.toolResultPrunerModule, tokenMeterModule: options.tokenMeterModule,
+    onWarning: code => ctx.logger?.warn?.('memory-brain: ' + String(code).replace(/[^a-zA-Z0-9_:.-]/g,'')) });
+  options.compactionSupport = support;
+  await support.ready;
+  if (isDisposed()) throw new Error('setup_closed');
   const controller = await createAdapter(ctx, options);
+  controller.contextPolicySignature=options.contextPolicySignature;
   if (isDisposed()) { await controller.stop(); throw new Error('setup_closed'); }
   if (!controller.enabled) throw new Error('memory_brain_adapter_not_enabled_see_dsh_log');
   // Unloading removes the adapter only. The kernel may serve another host or
   // an open panel, so it is never killed or purged by a DSH plugin disposer.
   return controller;
-  } catch (error) { bridge?.dispose(); throw error; }
+  } catch (error) { await support?.stop(); bridge?.dispose(); budget.stop(); throw error; }
 }
 
 function profileIdentity(ctx,config){
@@ -151,6 +168,8 @@ export async function apply(ctx,config={}){
   if(config.enabled!==true)return;
   if(Number(process.versions.node.split('.')[0])<22)throw new Error('node_22_or_later_required');
   if(config.requestBridge!==undefined)throw new Error('request_bridge_is_owned_by_the_verified_public_entry');
+  if(config.requestBudget!==undefined)throw new Error('request_budget_is_owned_by_the_verified_public_entry');
+  if(config.compactionSupport!==undefined)throw new Error('compaction_support_is_owned_by_the_verified_public_entry');
   if(config.token!==undefined||config.baseUrl!==undefined)throw new Error('use_local_brain_config_instead_of_inline_token_or_url');
   if(config.queueNamespace!==undefined&&!/^[a-zA-Z0-9_-]{1,80}$/.test(config.queueNamespace))throw new Error('queue_namespace_invalid');
   const runtime=config.runtimePath?probeRuntime(config.runtimePath):discoverRuntime({allowUnverified:true});
@@ -171,11 +190,17 @@ export async function apply(ctx,config={}){
   if(legacy){
     // An existing explicit/link install keeps its exact data, credentials and
     // startup contract. Never copy it into a new, empty managed installation.
-    const options=resolveConfiguration(config),manager=existingManager(options);
+    const options=resolveConfiguration(config),manager=existingManager(options),policy=contextSettings(options.configFile,config);
     const start=()=>{
-      if(controller?.enabled)return Promise.resolve(controller);
       if(activation)return activation;
-      activation=attach(ctx,options,async()=>{
+      activation=(async()=>{
+      const latest=resolveConfiguration(config);
+      if(controller?.enabled&&controller.contextPolicySignature===latest.contextPolicySignature)return controller;
+      if(controller?.enabled){
+        if(runningAgent(ctx))throw new Error('finish_current_chat_before_applying_context');
+        await controller.stop();controller=null;
+      }
+      return attach(ctx,latest,async()=>{
         if(config.autoStart===false)throw new Error('memory_brain_not_ready_start_the_local_launcher');
         if(process.platform!=='win32')throw new Error('automatic_start_windows_only_start_kernel_manually');
         if(path.resolve(options.configFile).toLowerCase()!==path.join(packageRoot,'private','config.json').toLowerCase())
@@ -183,24 +208,56 @@ export async function apply(ctx,config={}){
         try{await execute('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden',
           '-File',path.join(packageRoot,'scripts','start-local.ps1'),'-NoOpen'],{cwd:packageRoot,windowsHide:true,timeout:30000,maxBuffer:65536});}
         catch{throw new Error('memory_brain_start_failed_see_local_service_log');}
-      },isDisposed).then(value=>controller=value).finally(()=>activation=null);
+      },isDisposed);
+      })().then(value=>controller=value).finally(()=>activation=null);
       return activation;
     };
     setup=createOnboarding({manager,onStart:start,home:path.dirname(path.dirname(options.configFile)),
-      compatibility:runtime.compatibility,legacy:true,getAdapterStatus:()=>controller});
+      compatibility:runtime.compatibility,legacy:true,getAdapterStatus:()=>controller,
+      getContextSettings:()=>({settings:policy.read(),restart_required:Boolean(controller?.enabled&&controller.contextPolicySignature!==policy.signature())}),
+      saveContextSettings:body=>policy.save(body)});
     mountSetup(ctx,setup);
-    await start();return;
+    // Keep this installation's setup scope alive after a temporary backend
+    // outage. It owns neither the external kernel nor its startup contract.
+    try { await start(); }
+    catch (error) {
+      if (disposed) return;
+      setup.setError?.(error);
+      const suppliedInterval = Number(config.reconnectIntervalMs ?? 5000);
+      const retryMs = Number.isFinite(suppliedInterval) ? Math.max(1000, Math.min(60000, Math.floor(suppliedInterval))) : 5000;
+      const suppliedAttempts = Number(config.reconnectAttempts ?? 12);
+      const maxAttempts = Number.isFinite(suppliedAttempts) ? Math.max(0, Math.min(60, Math.floor(suppliedAttempts))) : 12;
+      let attempts = 0;
+      if (maxAttempts > 0) {
+        const timer = setInterval(() => {
+          if (disposed || controller?.enabled || attempts >= maxAttempts) { clearInterval(timer); return; }
+          if (activation) return;
+          attempts++;
+          start().then(() => { setup.setError?.(null); clearInterval(timer); })
+            .catch(failure => { if (!disposed) setup.setError?.(failure); });
+        }, retryMs);
+        timer.unref?.();
+        ctx.effect?.(() => () => clearInterval(timer));
+      }
+    }
+    return;
   }
   // GitHub/npm installs keep code replaceable and all mutable state in one
   // stable per-user/profile directory. Loading never calls initialize().
   const home=await resolveRuntimeHome({packageRoot,runtimeHome:config.runtimeHome,profile:profileIdentity(ctx,config)});
   const manager=createRuntimeManager({packageRoot,home});
+  const policy=contextSettings(path.join(home,'private','config.json'),config);
   const start=()=>{
     if(activation)return activation;
     activation=(async()=>{
       const state=await manager.status();
       if(disposed)throw new Error('setup_closed');
-      if(controller?.enabled&&state.running&&!state.restart_required)return controller;
+      const policyChanged=Boolean(controller?.enabled&&controller.contextPolicySignature!==policy.signature());
+      if(controller?.enabled&&state.running&&!state.restart_required&&!policyChanged)return controller;
+      if(policyChanged){
+        if(runningAgent(ctx))throw new Error('finish_current_chat_before_applying_context');
+        await controller.stop();controller=null;
+      }
       if(state.restart_required&&state.running){
         if(runningAgent(ctx))throw new Error('finish_current_chat_before_applying_models');
         await controller?.stop();controller=null;
@@ -215,7 +272,9 @@ export async function apply(ctx,config={}){
     })().then(value=>controller=value).finally(()=>activation=null);
     return activation;
   };
-  setup=createOnboarding({manager,onStart:start,home,compatibility:runtime.compatibility,getAdapterStatus:()=>controller});
+  setup=createOnboarding({manager,onStart:start,home,compatibility:runtime.compatibility,getAdapterStatus:()=>controller,
+    getContextSettings:()=>({settings:policy.read(),restart_required:Boolean(controller?.enabled&&controller.contextPolicySignature!==policy.signature())}),
+    saveContextSettings:body=>{if(!fs.existsSync(path.join(home,'private','config.json')))throw new Error('runtime_not_initialized');return policy.save(body);}});
   mountSetup(ctx,setup);
   const state=await manager.status();
   if(state.installed_version===state.expected_version&&state.state!=='error'&&config.autoStart!==false){
