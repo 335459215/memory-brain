@@ -46,11 +46,12 @@ function publicContextManagement(value){
     'estimated_total_tokens','limit','limit_tokens','input_limit','input_limit_tokens','reserved','reserved_tokens','remaining','remaining_tokens',
     'effective_limit','effective_input_limit','request_tokens','history_tokens','memory_tokens','output_reserve_tokens',
     'estimated_before_tokens','estimated_after_tokens','estimated_compacted_tokens','context_window_tokens','reserved_output_tokens',
-    'checks','passed','blocked','unguarded','partial','warnings',
+    'checks','passed','blocked','unguarded','partial','warnings','estimated_input_bytes',
     'agents','summary_max_chars','summary_max_tokens','cooldown_ms','threshold_chars','head_chars','tail_chars',
     'threshold_ratio','retain_ratio','headroom_tokens','pressure_cooldown_ms',
     'summaries','pressure_attempts','pressure_deferred','pruned_results','pruned_chars','last_summary_chars']);
-  const booleanFields=new Set(['enabled','available','supported','blocked','estimated','active','stopped']);
+  const booleanFields=new Set(['enabled','available','supported','blocked','estimated','active','stopped',
+    'estimated_over_limit','input_estimate_advisory','reserve_check_applied']);
   const clean=source=>{
     const result={};if(!source||typeof source!=='object')return result;
     for(const [key,item]of Object.entries(source)){
@@ -160,8 +161,18 @@ export function mountOnboarding(ctx,controller){
   const connection=ctx.get?.('connection')||ctx.connection;
   if(typeof connection?.fetch?.register!=='function')throw invalid('dsh_setup_connection_routes_required');
   const off=[];
+  let disposal;
+  const disposeRoutes=()=>disposal ||= (async()=>{
+    // Native Fetch registrations return asynchronous disposers. Always settle
+    // every cleanup, including rollback after a later route failed to mount.
+    // A teardown error must not escape as an unhandled rejection in the host.
+    const results=await Promise.allSettled(off.map(dispose=>Promise.resolve().then(()=>dispose())));
+    if(results.some(result=>result.status==='rejected')){
+      try{ctx.logger?.warn?.('memory-brain: setup_route_cleanup_failed');}catch{}
+    }
+  })();
   try{for(const action of ACTIONS)off.push(connection.fetch.register({
     path:SETUP_PREFIX+action,methods:[action==='status'?'GET':'POST'],requestBody:'buffered',fetch:request=>controller.handle(request)}));}
-  catch(error){for(const dispose of off)void dispose();throw error;}
-  return async()=>{await Promise.all(off.map(dispose=>dispose()));};
+  catch(error){void disposeRoutes();throw error;}
+  return disposeRoutes;
 }
